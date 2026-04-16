@@ -8,8 +8,17 @@
 
 - [Overview](#overview)
 - [Hardware](#hardware)
-  - [Components](#components)
-  - [Pin Wiring](#pin-wiring)
+  - [Bill of Materials](#bill-of-materials)
+  - [Power System](#power-system)
+  - [Complete Wiring Guide](#complete-wiring-guide)
+    - [System Block Diagram](#system-block-diagram)
+    - [Power Rail Connections](#power-rail-connections)
+    - [ESP32-C3 → SIM800L](#esp32-c3--sim800l)
+    - [ESP32-C3 → NEO-6M GPS](#esp32-c3--neo-6m-gps)
+    - [ESP32-C3 → SH1107 OLED](#esp32-c3--sh1107-oled)
+    - [ESP32-C3 → Buttons](#esp32-c3--buttons)
+    - [Full GPIO Map](#full-gpio-map)
+  - [Assembly Tips](#assembly-tips)
 - [Features](#features)
 - [Architecture](#architecture)
   - [FreeRTOS Task Map](#freertos-task-map)
@@ -46,37 +55,243 @@ Key design goals:
 
 ## Hardware
 
-### Components
+### Bill of Materials
 
-| Component | Part | Notes |
-|-----------|------|-------|
-| Microcontroller | ESP32-C3 DevKitM-1 | RISC-V, 4 MB Flash, Wi-Fi + BLE |
-| GPS Module | u-blox NEO-6M | UART, 9600 baud, 5 Hz update |
-| GSM Modem | SIM800L | 2G GPRS, UART, Hutch SL APN |
-| Display | SH1107 128×128 OLED | I²C, 0x3C address |
-| Buttons | Tactile × 2 | SELECT (BTN_A) + BACK (BTN_B) |
+| # | Component | Part / Module | Qty | Notes |
+|---|-----------|--------------|-----|-------|
+| 1 | Microcontroller | ESP32-C3 DevKitM-1 | 1 | RISC-V core, 4 MB Flash, Wi-Fi + BLE |
+| 2 | GPS Module | u-blox NEO-6M (GY-NEO6MV2) | 1 | UART, 9600 baud, 3.3 V logic, ceramic patch antenna |
+| 3 | GSM Modem | SIM800L EVB | 1 | 2G GPRS quad-band, UART, needs **3.4–4.4 V** |
+| 4 | Display | SH1107 128×128 OLED (1.5") | 1 | I²C, 3.3 V, address 0x3C |
+| 5 | Tactile Buttons | 6×6 mm momentary switch | 2 | SELECT (BTN_A) + BACK (BTN_B) |
+| 6 | Battery Cells | 18650 Li-ion × 2 | 2 | Connected **in parallel** (same voltage, doubled capacity) |
+| 7 | Protection Board | 3A BMS for 3.7 V 18650 | 1 | Over-charge, over-discharge, short-circuit protection |
+| 8 | Charging Module | IP2312 USB-C Fast Charge (3A) | 1 | 5 V USB-C in → 4.2 V Li-ion charge out |
+| 9 | Resistors | 10 kΩ × 2 | 2 | I²C pull-ups on SDA/SCL |
+| 10 | Capacitor | 100 µF electrolytic | 1 | Bulk decoupling on SIM800L VCC rail |
+| 11 | Wire / Jumpers | 22–26 AWG | — | Keep SIM800L power wires short and thick (≥22 AWG) |
 
-### Pin Wiring
+---
+
+### Power System
+
+The tracker runs from a **dual 18650 Li-ion pack** managed by dedicated BMS and charging ICs. Understanding the power chain is essential before wiring anything.
+
+#### Power Chain Overview
 
 ```
-ESP32-C3          Peripheral
-──────────────────────────────────────────
-GPIO 20 (TX)  ──► SIM800L RX
-GPIO 21 (RX)  ◄── SIM800L TX
-GPIO  0       ──► SIM800L RST / PWRKEY
-GPIO 10       ◄── SIM800L Ring Indicator (RI)
-
-GPIO  5 (TX)  ──► NEO-6M RX
-GPIO  4 (RX)  ◄── NEO-6M TX
-
-GPIO  8 (SDA) ──► SH1107 OLED SDA  (pull-up secures strapping HIGH)
-GPIO  9 (SCL) ──► SH1107 OLED SCL  (pull-up secures strapping HIGH)
-
-GPIO  3       ──► Button A (SELECT / CALL)
-GPIO  1       ──► Button B (BACK / HANG)
+┌─────────────────────────────────────────────────────────────────────┐
+│                        POWER CHAIN                                  │
+│                                                                     │
+│  USB-C Port                                                         │
+│  (5 V input)                                                        │
+│      │                                                              │
+│      ▼                                                              │
+│  ┌──────────────────────┐                                           │
+│  │  IP2312              │  Fast-charge IC                           │
+│  │  USB-C Charge Module │  5 V → 4.2 V CC/CV, up to 3 A           │
+│  └──────────┬───────────┘                                           │
+│             │  VBAT (3.7–4.2 V)                                     │
+│             ▼                                                        │
+│  ┌──────────────────────┐                                           │
+│  │  3A BMS              │  Balancing, over-charge/discharge,        │
+│  │  Protection Board    │  short-circuit protection                 │
+│  └──────────┬───────────┘                                           │
+│             │  VBAT_PROTECTED (3.7–4.2 V)                           │
+│             ├──────────────────────────────────────────────────┐    │
+│             │                                                  │    │
+│             ▼                                                  ▼    │
+│  ┌─────────────────┐                              ┌─────────────────┐│
+│  │  18650 Cell A   │◄──── Parallel ────►          │  18650 Cell B   ││
+│  │  (3.7 V nom.)   │                              │  (3.7 V nom.)   ││
+│  └─────────────────┘                              └─────────────────┘│
+│                                                                     │
+│  VBAT_PROTECTED also feeds the peripherals:                         │
+│      ├──► SIM800L VCC  (3.4–4.4 V direct — do NOT regulate down)   │
+│      │                                                              │
+│      └──► ESP32-C3 DevKitM-1 (via onboard 3.3 V LDO on the devkit) │
+│               └──► NEO-6M VCC (3.3 V from ESP32-C3 3.3 V pin)      │
+│               └──► SH1107 OLED VCC (3.3 V)                         │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-> **ℹ️ GPIO 8/9 strapping:** The 10 kΩ pull-ups required by I²C conveniently hold GPIO8 and GPIO9 HIGH during reset, satisfying ESP32-C3 strapping requirements without extra components.
+#### Power Component Details
+
+**① 18650 Cells — 2× in Parallel**
+- Connect **positive-to-positive** and **negative-to-negative** between both cells.
+- Parallel configuration keeps voltage at **3.7 V nominal / 4.2 V full**, doubles capacity (e.g., 2× 3000 mAh = 6000 mAh).
+- ⚠️ **Always use matched cells** (same capacity, same brand, same charge level at assembly).
+
+**② 3A BMS Protection Board**
+- Insert **between the cell pack and the rest of the circuit** — *never* power peripherals directly from bare cells.
+- Provides: over-charge cut-off (≈4.25 V), over-discharge cut-off (≈2.5 V), over-current and short-circuit protection.
+- Wiring: `B+` → cell pack positive, `B-` → cell pack negative; `P+/C+` → load/charger positive, `P-/C-` → load/charger negative.
+
+**③ IP2312 USB-C Fast Charge Module**
+- Handles **5 V USB-C PD/BC1.2 input** and outputs regulated **4.2 V CC/CV** to the BMS/battery.
+- Up to **3 A** charge current (set by the `ISET` resistor on the module).
+- Connect: `VIN+/VIN-` to the USB-C port 5 V rail; `VBAT+/VBAT-` to the BMS `C+/C-` (charge) pins.
+- The IP2312 typically has a built-in LED indicator for charge status — no extra components needed.
+
+> **⚠️ SIM800L Power Warning:** The SIM800L can draw **up to 2 A in burst** during GSM transmission. Power it **directly from `VBAT_PROTECTED`** (3.7–4.2 V), NOT from the ESP32-C3's 3.3 V pin (which is limited to ~600 mA). Add a **100 µF electrolytic capacitor** across the SIM800L VCC/GND pins to absorb transient spikes. Use **at least 22 AWG wire** for all SIM800L power connections.
+
+---
+
+### Complete Wiring Guide
+
+#### System Block Diagram
+
+```
+                         ┌─────────────────────────────────────────────────────┐
+                         │            GPS TRACKER V1.0 — BLOCK DIAGRAM         │
+                         └─────────────────────────────────────────────────────┘
+
+  ┌───────────────┐     VBAT (3.7–4.2V)      ┌──────────────────────────────┐
+  │  2× 18650     ├───────────────────────────►  IP2312 USB-C Charger        │
+  │  (Parallel)   │                           │  (charges via USB-C 5V)     │
+  └───────┬───────┘                           └──────────────────────────────┘
+          │ VBAT
+          ▼
+  ┌───────────────┐
+  │  3A BMS       │  ← short-circuit & over-voltage protection
+  └───────┬───────┘
+          │ VBAT_PROTECTED
+          ├─────────────────────────────────────────────────────────┐
+          │                                                         │
+          ▼                                                         ▼
+  ┌────────────────────┐  UART2 (TX20/RX21)   ┌──────────────────────────────┐
+  │                    ├─────────────────────►│  SIM800L GSM Modem           │
+  │                    │  RST: GPIO0           │  (GPRS uplink, 2G network)  │
+  │                    │  RI:  GPIO10          │                              │
+  │                    │                       │  Antenna ─────────► GSM ANT │
+  │   ESP32-C3         │                       └──────────────────────────────┘
+  │   DevKitM-1        │
+  │   (3.3V LDO on     │  UART1 (TX5/RX4)     ┌──────────────────────────────┐
+  │    board)          ├─────────────────────►│  NEO-6M GPS                  │
+  │                    │                       │  (NMEA @ 9600 baud)          │
+  │                    │                       │  Antenna ─────────► GPS ANT  │
+  │                    │                       └──────────────────────────────┘
+  │                    │
+  │                    │  I2C (SDA8/SCL9)      ┌──────────────────────────────┐
+  │                    ├─────────────────────►│  SH1107 128×128 OLED         │
+  │                    │                       │  (status display, I2C 0x3C)  │
+  │                    │                       └──────────────────────────────┘
+  │                    │
+  │                    │  GPIO3 ───────────── Button A (SELECT)
+  │                    │  GPIO1 ───────────── Button B (BACK)
+  └────────────────────┘
+```
+
+---
+
+#### Power Rail Connections
+
+| From | To | Wire | Notes |
+|------|----|------|-------|
+| Cell Pack `B+` | BMS `B+` | 22 AWG red | Match both cells first |
+| Cell Pack `B-` | BMS `B-` | 22 AWG black | |
+| BMS `P+` | IP2312 `VBAT+` | 22 AWG red | Charge path |
+| BMS `P-` | IP2312 `VBAT-` | 22 AWG black | |
+| BMS `P+` | SIM800L `VCC` | 22 AWG red | Direct battery voltage — crucial! |
+| BMS `P-` | SIM800L `GND` | 22 AWG black | |
+| BMS `P+` → 100µF cap → GND | SIM800L `VCC` | — | Electrolytic cap across SIM800L power pins |
+| BMS `P+` | ESP32-C3 `VIN` | 22 AWG red | DevKit onboard LDO → 3.3 V |
+| BMS `P-` | ESP32-C3 `GND` | 22 AWG black | Common ground |
+| ESP32-C3 `3.3V` | NEO-6M `VCC` | 26 AWG red | GPS runs on 3.3 V |
+| ESP32-C3 `GND` | NEO-6M `GND` | 26 AWG black | |
+| ESP32-C3 `3.3V` | OLED `VCC` | 26 AWG red | |
+| ESP32-C3 `GND` | OLED `GND` | 26 AWG black | |
+
+> **ℹ️ Common Ground:** All GND pins across all modules (ESP32-C3, SIM800L, NEO-6M, OLED, BMS) must be connected together as a single common ground reference.
+
+---
+
+#### ESP32-C3 → SIM800L
+
+| ESP32-C3 Pin | SIM800L Pin | Signal | Notes |
+|-------------|-------------|--------|-------|
+| `GPIO 20` (TX) | `RXD` | UART TX | 3.3 V logic — SIM800L is 5 V tolerant |
+| `GPIO 21` (RX) | `TXD` | UART RX | SIM800L outputs 2.8 V logic — safe for ESP32 |
+| `GPIO 0` | `RST` or `PWRKEY` | Reset / Power Key | Pull LOW for 1 s to toggle power |
+| `GPIO 10` | `RI` | Ring Indicator | Optional — wake-on-SMS |
+| `GND` | `GND` | Ground | Must share common GND |
+| *(VBAT from BMS)* | `VCC` | Power | **3.7–4.2 V direct** — do NOT use 3.3 V pin |
+
+> **⚠️ Do NOT connect SIM800L VCC to the ESP32-C3's 3.3 V pin.** The SIM800L bursts up to 2 A and will brown-out or permanently damage the ESP32-C3's onboard LDO. Power it directly from the battery-protected rail.
+
+---
+
+#### ESP32-C3 → NEO-6M GPS
+
+| ESP32-C3 Pin | NEO-6M Pin | Signal | Notes |
+|-------------|-----------|--------|-------|
+| `GPIO 5` (TX) | `RX` | UART TX | Sends config commands to GPS |
+| `GPIO 4` (RX) | `TX` | UART RX | Receives NMEA sentences |
+| `3.3V` | `VCC` | Power | 3.3 V — do not exceed |
+| `GND` | `GND` | Ground | |
+
+> **ℹ️ Antenna placement:** Mount the NEO-6M with the ceramic patch antenna facing upward, ideally near a window or with a clear sky view. Avoid placing it near metal enclosures or the SIM800L antenna.
+
+---
+
+#### ESP32-C3 → SH1107 OLED
+
+| ESP32-C3 Pin | OLED Pin | Signal | Notes |
+|-------------|---------|--------|-------|
+| `GPIO 8` | `SDA` | I²C Data | Add 10 kΩ pull-up to 3.3 V |
+| `GPIO 9` | `SCL` | I²C Clock | Add 10 kΩ pull-up to 3.3 V |
+| `3.3V` | `VCC` | Power | |
+| `GND` | `GND` | Ground | |
+
+> **ℹ️ GPIO 8/9 Strapping Pins:** GPIO8 and GPIO9 are ESP32-C3 strapping pins that must be HIGH at boot. The 10 kΩ I²C pull-up resistors naturally hold them HIGH, satisfying this requirement without any extra components. Connect one end of each 10 kΩ resistor to 3.3 V and the other end to the respective GPIO/OLED pin.
+
+---
+
+#### ESP32-C3 → Buttons
+
+Both buttons are wired as **active-low** (pressed = LOW). The firmware uses the internal pull-up (`INPUT_PULLUP` mode).
+
+| ESP32-C3 Pin | Button | Other Terminal | Signal |
+|-------------|--------|----------------|--------|
+| `GPIO 3` | Button A (SELECT / CALL) | `GND` | Active LOW |
+| `GPIO 1` | Button B (BACK / HANG) | `GND` | Active LOW |
+
+No external resistors are required — the ESP32-C3's internal pull-ups are used.
+
+---
+
+#### Full GPIO Map
+
+| GPIO | Direction | Function | Peripheral |
+|------|-----------|----------|------------|
+| 0 | OUT | SIM800L RST/PWRKEY | GSM Modem |
+| 1 | IN | Button B (BACK) | Tactile switch |
+| 3 | IN | Button A (SELECT) | Tactile switch |
+| 4 | IN (UART1 RX) | GPS NMEA receive | NEO-6M TX |
+| 5 | OUT (UART1 TX) | GPS config transmit | NEO-6M RX |
+| 8 | I/O (I²C SDA) | Display data | SH1107 OLED |
+| 9 | OUT (I²C SCL) | Display clock | SH1107 OLED |
+| 10 | IN | SIM800L Ring Indicator | GSM Modem |
+| 20 | OUT (UART2 TX) | GSM command transmit | SIM800L RXD |
+| 21 | IN (UART2 RX) | GSM response receive | SIM800L TXD |
+
+---
+
+### Assembly Tips
+
+> 💡 **For beginners — recommended build order:**
+
+1. **Test each module independently first.** Flash a simple sketch that only talks to one peripheral at a time before combining everything.
+2. **Double-check power rails** before connecting anything: confirm BMS `P+` outputs ~3.7–4.2 V with a multimeter.
+3. **SIM800L power first** — if it doesn't register on the network, check its VCC voltage (should be 3.7–4.2 V) and look for the `NETLIGHT` LED blinking every 3 s (registered).
+4. **Keep wire lengths short** — especially power wires to the SIM800L. Long wires add resistance and inductance that cause brownout resets during GSM transmit bursts.
+5. **Strain-relieve antennas** — the GSM and GPS antenna connectors (U.FL/IPEX) are fragile. Secure the antenna cable so it can't pull on the connector.
+6. **Serial monitor is your friend** — open the PlatformIO serial monitor at 115200 baud; every module logs its status with a `[TAG]` prefix.
+7. **Common faults checklist:**
+   - OLED blank → check SDA/SCL not swapped, and I²C address is 0x3C
+   - No GPS fix → antenna facing sky? Wait up to 2 minutes for cold-start
+   - SIM800L rebooting → power issue; add 100 µF cap, check wire gauge
+   - GPRS not connecting → verify APN in `config.h` matches your network carrier
 
 ---
 
