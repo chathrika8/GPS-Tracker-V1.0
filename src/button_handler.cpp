@@ -7,8 +7,6 @@ ButtonHandler buttonHandler;
 void ButtonHandler::begin() {
     pinMode(BTN_A, INPUT_PULLUP);
     pinMode(BTN_B, INPUT_PULLUP);
-    // Serial.println("[BTN] Buttons ready (A=GPIO" + String(BTN_A) +
-    //                ", B=GPIO" + String(BTN_B) + ")");
 }
 
 ButtonEvent ButtonHandler::poll() {
@@ -22,23 +20,18 @@ ButtonEvent ButtonHandler::poll() {
     if ((now - _lastDebounceA) > BUTTON_DEBOUNCE) {
         if (readA != _btnAState) {
             _btnAState = readA;
-
             if (_btnAState == LOW) {
-                // Pressed
                 _btnAPressTime = now;
-                _btnAHandled = false;
+                _btnAHandled   = false;
             } else {
-                // Released
                 if (!_btnAHandled) {
-                    unsigned long duration = now - _btnAPressTime;
-                    event = (duration >= LONG_PRESS_MS) ? BTN_A_LONG : BTN_A_SHORT;
+                    unsigned long held = now - _btnAPressTime;
+                    event = (held >= LONG_PRESS_MS) ? BTN_A_LONG : BTN_A_SHORT;
                 }
             }
         }
-
-        // Detect long press while still held
-        if (_btnAState == LOW && !_btnAHandled &&
-            (now - _btnAPressTime) >= LONG_PRESS_MS) {
+        // Fire long-press event while the button is still held down
+        if (_btnAState == LOW && !_btnAHandled && (now - _btnAPressTime) >= LONG_PRESS_MS) {
             event = BTN_A_LONG;
             _btnAHandled = true;
         }
@@ -52,20 +45,17 @@ ButtonEvent ButtonHandler::poll() {
     if ((now - _lastDebounceB) > BUTTON_DEBOUNCE) {
         if (readB != _btnBState) {
             _btnBState = readB;
-
             if (_btnBState == LOW) {
                 _btnBPressTime = now;
-                _btnBHandled = false;
+                _btnBHandled   = false;
             } else {
                 if (!_btnBHandled) {
-                    unsigned long duration = now - _btnBPressTime;
-                    event = (duration >= LONG_PRESS_MS) ? BTN_B_LONG : BTN_B_SHORT;
+                    unsigned long held = now - _btnBPressTime;
+                    event = (held >= LONG_PRESS_MS) ? BTN_B_LONG : BTN_B_SHORT;
                 }
             }
         }
-
-        if (_btnBState == LOW && !_btnBHandled &&
-            (now - _btnBPressTime) >= LONG_PRESS_MS) {
+        if (_btnBState == LOW && !_btnBHandled && (now - _btnBPressTime) >= LONG_PRESS_MS) {
             event = BTN_B_LONG;
             _btnBHandled = true;
         }

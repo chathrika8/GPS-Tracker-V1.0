@@ -8,68 +8,53 @@
 OTAManager otaManager;
 
 void OTAManager::begin() {
-    Serial.println("[OTA] Manager ready.");
+    Serial.println("[OTA] Ready.");
 }
 
 void OTAManager::checkAndUpdate() {
     Serial.println("[OTA] Checking for updates...");
 
-    // Try GitHub first (primary)
-    if (checkGitHub()) {
-        Serial.printf("[OTA] GitHub update available: %s\n", _availableVersion);
-        // Download will happen inside checkGitHub if update found
-        return;
-    }
+    if (checkGitHub()) return;    // GitHub is primary
+    if (checkSupabase()) return;  // Supabase manifest is the fallback
 
-    // Fallback to Supabase manifest
-    if (checkSupabase()) {
-        Serial.printf("[OTA] Supabase update available: %s\n", _availableVersion);
-        return;
-    }
-
-    Serial.println("[OTA] No updates available.");
+    Serial.println("[OTA] Firmware is up to date.");
 }
 
 bool OTAManager::checkGitHub() {
-    // Use WiFi for faster download if available, otherwise GPRS
     TinyGsmClient& client = gsmManager.getClient();
 
     if (!client.connect("api.github.com", 443)) {
-        Serial.println("[OTA] Cannot reach GitHub API");
+        Serial.println("[OTA] Cannot reach api.github.com");
         return false;
     }
 
-    String path = "/repos/" + String(GITHUB_REPO_OWNER) + "/" +
-                  String(GITHUB_REPO_NAME) + "/releases/latest";
+    String path = "/repos/" + String(GITHUB_REPO_OWNER) + "/"
+                + String(GITHUB_REPO_NAME) + "/releases/latest";
 
     client.print("GET " + path + " HTTP/1.1\r\n");
     client.print("Host: api.github.com\r\n");
     client.print("User-Agent: ESP32-GPS-Tracker\r\n");
-    if (strlen(GITHUB_TOKEN) > 0) {
+    if (strlen(GITHUB_TOKEN) > 0)
         client.print("Authorization: Bearer " + String(GITHUB_TOKEN) + "\r\n");
-    }
     client.print("Connection: close\r\n\r\n");
 
-    // Wait for response
-    unsigned long timeout = millis() + 15000;
-    while (!client.available() && millis() < timeout) delay(10);
+    unsigned long deadline = millis() + 15000;
+    while (!client.available() && millis() < deadline) delay(10);
 
-    // Skip headers
-    bool headersDone = false;
-    String body = "";
+    bool bodyStarted = false;
+    String body;
     while (client.available()) {
         String line = client.readStringUntil('\n');
-        if (!headersDone) {
-            if (line == "\r" || line == "") headersDone = true;
+        if (!bodyStarted) {
+            if (line == "\r" || line == "") bodyStarted = true;
         } else {
             body += line;
         }
     }
     client.stop();
 
-    if (body.length() == 0) return false;
+    if (body.isEmpty()) return false;
 
-    // Parse JSON — extract tag_name and asset URLs
     JsonDocument doc;
     if (deserializeJson(doc, body) != DeserializationError::Ok) {
         Serial.println("[OTA] Failed to parse GitHub response");
@@ -79,76 +64,70 @@ bool OTAManager::checkGitHub() {
     const char* tagName = doc["tag_name"];
     if (!tagName) return false;
 
-    // Strip 'v' prefix for comparison
-    const char* version = tagName;
-    if (version[0] == 'v' || version[0] == 'V') version++;
+    // Strip optional 'v' prefix so "v1.2.0" and "1.2.0" both work
+    const char* version = (tagName[0] == 'v' || tagName[0] == 'V') ? tagName + 1 : tagName;
 
-    // Simple version comparison (string-based; works for semver)
     if (strcmp(version, FW_VERSION) <= 0) {
-        Serial.printf("[OTA] GitHub version %s is not newer than %s\n", version, FW_VERSION);
+        Serial.printf("[OTA] GitHub: %s — no update needed\n", version);
         return false;
     }
 
     strncpy(_availableVersion, version, sizeof(_availableVersion));
     _updateAvailable = true;
 
-    // Find firmware.bin asset
-    String firmwareUrl = "";
-    String sha256Url   = "";
-    JsonArray assets = doc["assets"].as<JsonArray>();
-    for (JsonObject asset : assets) {
-        String name = asset["name"].as<String>();
-        String url  = asset["browser_download_url"].as<String>();
-        if (name == "firmware.bin") firmwareUrl = url;
-        if (name == "sha256.txt")  sha256Url = url;
+    // Find the firmware.bin asset in this release
+    String firmwareUrl;
+    for (JsonObject asset : doc["assets"].as<JsonArray>()) {
+        if (String(asset["name"].as<String>()) == "firmware.bin") {
+            firmwareUrl = asset["browser_download_url"].as<String>();
+            break;
+        }
     }
 
-    if (firmwareUrl.length() == 0) {
-        Serial.println("[OTA] No firmware.bin asset found in release");
+    if (firmwareUrl.isEmpty()) {
+        Serial.println("[OTA] No firmware.bin in release assets");
         return false;
     }
 
-    // Download and flash
-    Serial.printf("[OTA] Downloading firmware v%s from GitHub...\n", version);
+    Serial.printf("[OTA] Downloading v%s...\n", version);
     return downloadAndFlash(firmwareUrl.c_str(), 0, "");
 }
 
 bool OTAManager::checkSupabase() {
     TinyGsmClient& client = gsmManager.getClient();
 
-    // Extract host from PROXY_HOST
     String host = String(PROXY_HOST);
-    int slashPos = host.indexOf('/');
-    if (slashPos > 0) host = host.substring(0, slashPos);
+    int slash = host.indexOf('/');
+    if (slash > 0) host = host.substring(0, slash);
 
     if (!client.connect(host.c_str(), 80)) return false;
 
-    String endpoint = "/rest/v1/" + String(SUPABASE_TABLE) + "/ota/manifest"; // Example path
-    client.print("GET "); client.print(endpoint); client.print(" HTTP/1.1\r\n");
-    client.print("Host: "); client.print(host); client.print("\r\n");
+    String endpoint = "/rest/v1/" + String(SUPABASE_TABLE) + "/ota/manifest";
+    client.print("GET " + endpoint + " HTTP/1.1\r\n");
+    client.print("Host: " + host + "\r\n");
     client.print("User-Agent: ESP32-GPS-Tracker/1.0\r\n");
     client.print("Connection: close\r\n\r\n");
     client.flush();
 
-    unsigned long timeout = millis() + 15000;
-    while (!client.available() && millis() < timeout) {
+    unsigned long deadline = millis() + 15000;
+    while (!client.available() && millis() < deadline) {
         delay(10);
         if (!client.connected()) break;
     }
 
-    bool headersDone = false;
-    String body = "";
+    bool bodyStarted = false;
+    String body;
     while (client.available()) {
         String line = client.readStringUntil('\n');
-        if (!headersDone) {
-            if (line == "\r" || line == "") headersDone = true;
+        if (!bodyStarted) {
+            if (line == "\r" || line == "") bodyStarted = true;
         } else {
             body += line;
         }
     }
     client.stop();
 
-    if (body.length() == 0) return false;
+    if (body.isEmpty()) return false;
 
     JsonDocument doc;
     if (deserializeJson(doc, body) != DeserializationError::Ok) return false;
@@ -159,38 +138,23 @@ bool OTAManager::checkSupabase() {
     strncpy(_availableVersion, version, sizeof(_availableVersion));
     _updateAvailable = true;
 
-    const char* url    = doc["url"];
-    size_t      size   = doc["size"] | 0;
-    const char* sha256 = doc["sha256"] | "";
-
-    return downloadAndFlash(url, size, sha256);
+    return downloadAndFlash(doc["url"] | "", doc["size"] | 0, doc["sha256"] | "");
 }
 
 bool OTAManager::downloadAndFlash(const char* url, size_t expectedSize, const char* sha256) {
-    // For now, use the TinyGSM client to download the binary
-    // A full implementation would handle chunked transfer, SHA256 verification,
-    // and write to the OTA partition using the Update library.
-
-    Serial.printf("[OTA] Starting firmware download from: %s\n", url);
-    Serial.println("[OTA] NOTE: Full OTA download implementation pending — ");
-    Serial.println("[OTA]       requires HTTP redirect handling for GitHub URLs.");
-
-    // Placeholder for the actual OTA flash logic:
+    // TODO: implement full OTA download and flash.
     //
-    // 1. Connect to URL (handle redirects)
-    // 2. Begin Update: Update.begin(expectedSize)
-    // 3. Stream data:  Update.write(buf, len) in chunks
-    // 4. Finalize:     Update.end(true)
-    // 5. Verify SHA256 if provided
-    // 6. Reboot:       ESP.restart()
+    // Outline:
+    //   1. Follow GitHub's redirect chain to the CDN URL
+    //   2. Stream binary into Update.write() in ~4 KB chunks
+    //   3. Call Update.end(true) and verify SHA-256 if provided
+    //   4. ESP.restart() — bootloader handles slot swap automatically
+    //
+    // Blocked on: HTTP redirect handling over TinyGSM raw TCP.
 
-    return false; // Return false until fully implemented
+    Serial.printf("[OTA] Download pending — URL: %s\n", url);
+    return false;
 }
 
-bool OTAManager::isUpdateAvailable() {
-    return _updateAvailable;
-}
-
-const char* OTAManager::getAvailableVersion() {
-    return _availableVersion;
-}
+bool OTAManager::isUpdateAvailable()     { return _updateAvailable; }
+const char* OTAManager::getAvailableVersion() { return _availableVersion; }

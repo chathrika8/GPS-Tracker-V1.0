@@ -3,7 +3,7 @@
 
 GSMManager gsmManager;
 
-// UART1 instance for SIM800L to escape UART0 collision
+// Use UART1 so SIM800L doesn't share UART0 with GPS/debug output
 static HardwareSerial gsmSerial(1);
 
 void GSMManager::begin() {
@@ -16,44 +16,41 @@ void GSMManager::begin() {
 
     Serial.println("[GSM] Initializing modem...");
 
-    // Hardware reset if pin defined
     pinMode(SIM800L_RST, OUTPUT);
     resetModem();
 
-    // Initialize modem
     if (!_modem->restart()) {
-        Serial.println("[GSM] Modem restart failed, trying init...");
+        Serial.println("[GSM] Modem restart failed, falling back to init()");
         _modem->init();
     }
 
-    String modemInfo = _modem->getModemInfo();
-    Serial.printf("[GSM] Modem: %s\n", modemInfo.c_str());
+    Serial.printf("[GSM] Modem: %s\n", _modem->getModemInfo().c_str());
 
-    // Network registration and GPRS connection will be handled
-    // asynchronously by the Uplink task to prevent WDT resets in setup().
+    // Network registration and GPRS are handled by the Uplink task so
+    // that a slow SIM attach doesn't block setup() and freeze the display.
 }
 
 bool GSMManager::connectGPRS() {
     Serial.printf("[GSM] Connecting GPRS (APN: %s)...\n", GPRS_APN);
     if (!_modem->gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS)) {
-        Serial.println("[GSM] GPRS connection failed!");
+        Serial.println("[GSM] GPRS connect failed");
         return false;
     }
-    Serial.println("[GSM] GPRS connected.");
+    Serial.println("[GSM] GPRS up");
     return true;
 }
 
 void GSMManager::ensureConnection() {
     if (!_modem->isNetworkConnected()) {
-        Serial.println("[GSM] Network lost, re-registering...");
+        Serial.println("[GSM] Lost network — waiting for re-registration...");
         unsigned long start = millis();
-        // Manual wait loop to ensure vTaskDelay feeds the WDT on ESP32-C3
+        // Use vTaskDelay instead of delay() so the FreeRTOS watchdog stays fed
         while (!_modem->isNetworkConnected() && (millis() - start < 30000L)) {
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
     if (!_modem->isGprsConnected()) {
-        Serial.println("[GSM] GPRS lost, reconnecting...");
+        Serial.println("[GSM] GPRS down — reconnecting...");
         connectGPRS();
     }
 }
@@ -68,7 +65,7 @@ int GSMManager::getSignalStrength() {
 
 int GSMManager::getSignalPercent() {
     int rssi = getSignalStrength();
-    if (rssi == 99) return 0;        // unknown
+    if (rssi == 99) return 0;  // 99 = unknown / not detectable
     return map(rssi, 0, 31, 0, 100);
 }
 
@@ -80,27 +77,22 @@ String GSMManager::getOperator() {
     return _modem->getOperator();
 }
 
-TinyGsmClient& GSMManager::getClient() {
-    return *_client;
-}
-
-TinyGsm& GSMManager::getModem() {
-    return *_modem;
-}
+TinyGsmClient& GSMManager::getClient() { return *_client; }
+TinyGsm&       GSMManager::getModem()  { return *_modem;  }
 
 void GSMManager::resetModem() {
     digitalWrite(SIM800L_RST, LOW);
     delay(150);
     digitalWrite(SIM800L_RST, HIGH);
-    delay(3000); // Wait for modem to boot
+    delay(3000);  // SIM800L needs ~3 s to boot after PWRKEY pulse
 }
 
 void GSMManager::setAlarm(const char* datetime) {
-    // AT+CALA="2026/03/22,17:00:00+22",0,0,"GPS"
+    // Format: "2026/03/22,17:00:00+22"  (offset in quarters of an hour)
     String cmd = "AT+CALA=\"" + String(datetime) + "\",0,0,\"GPS\"";
     _modem->sendAT(cmd.c_str());
     _modem->waitResponse(1000);
-    Serial.printf("[GSM] Alarm set: %s\n", datetime);
+    Serial.printf("[GSM] RTC alarm set: %s\n", datetime);
 }
 
 void GSMManager::clearAlarm() {
@@ -109,9 +101,10 @@ void GSMManager::clearAlarm() {
 }
 
 void GSMManager::setFunctionality(int mode) {
-    // AT+CFUN=0 (minimum, keeps RTC) or AT+CFUN=1 (full, keeps SMS/RI)
+    // AT+CFUN=0 — minimum power (RTC stays alive, radio off)
+    // AT+CFUN=1 — full function (needed for SMS/RI wake)
     String cmd = "+CFUN=" + String(mode);
     _modem->sendAT(cmd.c_str());
     _modem->waitResponse(5000);
-    Serial.printf("[GSM] CFUN set to %d\n", mode);
+    Serial.printf("[GSM] CFUN=%d\n", mode);
 }

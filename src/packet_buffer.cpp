@@ -7,42 +7,36 @@ const char* PacketBuffer::BUFFER_FILE = "/gps_buffer.bin";
 
 void PacketBuffer::begin() {
     if (!LittleFS.begin(true)) {
-        Serial.println("[BUF] LittleFS mount failed! Attempting format...");
-        if (!LittleFS.format()) {
-            Serial.println("[BUF] LittleFS format failed!");
-            return;
-        }
-        if (!LittleFS.begin(false)) {
-            Serial.println("[BUF] LittleFS re-mount failed!");
+        Serial.println("[BUF] LittleFS mount failed — formatting...");
+        if (!LittleFS.format() || !LittleFS.begin(false)) {
+            Serial.println("[BUF] LittleFS unrecoverable");
             return;
         }
     }
 
-    // Check if buffer file exists and get its size
     if (LittleFS.exists(BUFFER_FILE)) {
         File f = LittleFS.open(BUFFER_FILE, FILE_READ);
         if (f) {
-            _count = f.size() / sizeof(GPSPacket);
+            _count       = f.size() / sizeof(GPSPacket);
             _writeOffset = f.size();
             f.close();
-            Serial.printf("[BUF] Restored %u buffered packets\n", _count);
+            Serial.printf("[BUF] Resumed with %u packets\n", _count);
         }
-    } else {
-        Serial.println("[BUF] No existing buffer, starting fresh.");
     }
 }
 
 bool PacketBuffer::store(const GPSPacket& pkt) {
     if (_count >= MAX_PACKETS) {
-        // Circular: remove oldest by rewriting
-        // For simplicity, we truncate when full (can be improved to circular)
-        Serial.println("[BUF] Buffer full! Oldest packets will be lost.");
+        // Buffer full — drop everything and start fresh. This is intentional:
+        // after a very long outage the old data is stale anyway, and we'd
+        // rather send fresh positions than flood the server with history.
+        Serial.println("[BUF] Full — clearing stale packets");
         clear();
     }
 
     File f = LittleFS.open(BUFFER_FILE, FILE_APPEND);
     if (!f) {
-        Serial.println("[BUF] Failed to open buffer for writing!");
+        Serial.println("[BUF] Open for write failed");
         return false;
     }
 
@@ -66,14 +60,10 @@ int PacketBuffer::readBatch(GPSPacket* out, int maxCount) {
     f.seek(_readOffset);
 
     int toRead = min((int)_count, maxCount);
-    int read = 0;
-
+    int read   = 0;
     for (int i = 0; i < toRead; i++) {
-        if (f.read((uint8_t*)&out[i], sizeof(GPSPacket)) == sizeof(GPSPacket)) {
-            read++;
-        } else {
-            break;
-        }
+        if (f.read((uint8_t*)&out[i], sizeof(GPSPacket)) != sizeof(GPSPacket)) break;
+        read++;
     }
 
     f.close();
@@ -84,31 +74,29 @@ void PacketBuffer::removeBatch(int count) {
     if (count <= 0) return;
 
     _readOffset += count * sizeof(GPSPacket);
-    _count -= count;
+    _count      -= count;
 
-    // If buffer is fully drained, reset the file
     if (_count == 0) {
+        // All packets sent — delete the file rather than leaving an empty one
         LittleFS.remove(BUFFER_FILE);
         _readOffset  = 0;
         _writeOffset = 0;
+        return;
     }
-    // Compact file periodically if readOffset gets too large
-    else if (_readOffset > sizeof(GPSPacket) * 500) {
-        // Rewrite remaining packets to start of file
-        File src = LittleFS.open(BUFFER_FILE, FILE_READ);
-        if (!src) return;
 
-        src.seek(_readOffset);
-
-        // Read remaining into temp buffer
+    // Compact the file once the dead head grows beyond 500 packet-slots.
+    // This bounds flash wear by avoiding unbounded file growth.
+    if (_readOffset > sizeof(GPSPacket) * 500) {
         size_t remaining = _count * sizeof(GPSPacket);
         uint8_t* tmp = (uint8_t*)malloc(remaining);
-        if (!tmp) { src.close(); return; }
+        if (!tmp) return;
 
+        File src = LittleFS.open(BUFFER_FILE, FILE_READ);
+        if (!src) { free(tmp); return; }
+        src.seek(_readOffset);
         src.read(tmp, remaining);
         src.close();
 
-        // Rewrite
         File dst = LittleFS.open(BUFFER_FILE, FILE_WRITE);
         if (dst) {
             dst.write(tmp, remaining);
@@ -121,18 +109,13 @@ void PacketBuffer::removeBatch(int count) {
     }
 }
 
-uint32_t PacketBuffer::count() {
-    return _count;
-}
+uint32_t PacketBuffer::count()  { return _count; }
+bool     PacketBuffer::isFull() { return _count >= MAX_PACKETS; }
 
 void PacketBuffer::clear() {
     LittleFS.remove(BUFFER_FILE);
     _readOffset  = 0;
     _writeOffset = 0;
     _count       = 0;
-    Serial.println("[BUF] Buffer cleared.");
-}
-
-bool PacketBuffer::isFull() {
-    return _count >= MAX_PACKETS;
+    Serial.println("[BUF] Cleared");
 }

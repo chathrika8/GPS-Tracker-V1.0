@@ -52,11 +52,9 @@ void PowerManager::enterDeepSleep(uint64_t wakeAfterUs) {
 }
 
 float PowerManager::readBatteryVoltage(int* percent_out) {
-    // Use SIM800L AT+CBC to read voltage at its VCC pin
-    // Response format: +CBC: <bcs>,<bcl>,<voltage>
-    //   bcs: 0=not charging, 1=charging, 2=done
-    //   bcl: battery charge level 0-100%
-    //   voltage: in mV (e.g. 3870 = 3.87V)
+    // AT+CBC response: "+CBC: <bcs>,<bcl>,<voltage_mV>"
+    //   bcs: 0=not charging  1=charging  2=done
+    //   bcl: 0–100%  voltage: millivolts
 
     TinyGsm& modem = gsmManager.getModem();
     modem.sendAT("+CBC");

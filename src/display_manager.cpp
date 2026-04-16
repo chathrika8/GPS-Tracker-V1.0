@@ -12,13 +12,13 @@ void DisplayManager::begin() {
         return;
     }
 
-    // Increase I2C clock speed to 400kHz (Fast Mode) for much higher framerate
-    Wire.setClock(400000);
+    Wire.setClock(400000);  // 400 kHz fast-mode for a higher OLED framerate
 
-    _display->setRotation(2); // Flipped 180 degrees for chassis mount
+    _display->setRotation(2); // mounted upside-down in chassis
     _display->clearDisplay();
     _display->setTextColor(SH110X_WHITE);
-    // --- Premium Boot Animation ---
+
+    // Boot splash — type out "GPS\nTRACKER" then sweep two horizontal lines
     _display->setTextSize(2);
     const char line1[] = "GPS";
     const char line2[] = "TRACKER";
