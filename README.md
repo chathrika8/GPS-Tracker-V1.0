@@ -402,8 +402,6 @@ Please ensure all changes build cleanly with `pio run` before submitting.
 
 ## License
 
-This project is released under the [MIT License](LICENSE).
+This project is released under a proprietary license.
 
 ---
-
-*Built with ❤️ using PlatformIO + Arduino framework on ESP32-C3.*
