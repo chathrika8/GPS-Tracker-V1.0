@@ -402,6 +402,6 @@ Please ensure all changes build cleanly with `pio run` before submitting.
 
 ## License
 
-This project is released under a proprietary license.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
