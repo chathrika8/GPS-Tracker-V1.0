@@ -75,6 +75,10 @@ struct DeviceState {
 
     // Schedule
     bool     schedule_active;   // currently in a tracking window?
+
+    // AGPS
+    bool     agps_injected;     // true once UBX-AID-INI / MGA bytes were sent
+    uint16_t agps_bytes;        // bytes streamed from AssistNow on last attempt
 };
 
 class GPSManager {
@@ -83,12 +87,26 @@ public:
     void update();
     void fillState(DeviceState& state);
 
+    // Inject UTC + last-known position via UBX-AID-INI. Time epoch == 0 means
+    // "skip time" (no GSM time sync yet). Lat/lon == 0 means "skip position".
+    void injectAidIni(uint32_t utcEpoch, double lat, double lon, float altM);
+
+    // Stream a raw UBX/MGA blob (typically returned by the AssistNow Worker)
+    // straight to the GPS UART. The bytes are forwarded unmodified.
+    void injectAssistNowBlob(const uint8_t* data, size_t len);
+
+    // Persist the most recent valid fix to NVS so the next boot can seed
+    // UBX-AID-INI without waiting for a fresh fix.
+    void saveLastPositionToNVS(double lat, double lon, float altM, uint32_t epoch);
+    bool loadLastPositionFromNVS(double* lat, double* lon, float* altM, uint32_t* epoch);
+
 private:
     TinyGPSPlus  _gps;
     HardwareSerial* _serial = nullptr;
 
     void configureUBX();
     void sendUBX(const uint8_t* msg, size_t len);
+    void appendUbxChecksum(uint8_t* buf, size_t payloadStart, size_t payloadEnd);
     const char* courseToCompass(double course);
     uint32_t computeUnixEpoch(int year, int month, int day, int hour, int minute, int second);
 };
