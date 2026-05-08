@@ -1,7 +1,9 @@
 #include "gps_manager.h"
 #include "config.h"
+#include <Preferences.h>
 
 GPSManager gpsManager;
+static Preferences gpsPrefs;
 
 // UBX-CFG-RATE: 200 ms measurement period → 5 Hz output
 static const uint8_t UBX_CFG_RATE_5HZ[] = {
@@ -12,19 +14,20 @@ static const uint8_t UBX_CFG_RATE_5HZ[] = {
     0xDE, 0x6A   // checksum
 };
 
-// UBX-CFG-PRT: switch UART1 to 115200 baud, keep UBX+NMEA in/out
-static const uint8_t UBX_CFG_PRT_115200[] = {
+// UBX-CFG-PRT: switch UART1 to 38400 baud, keep UBX+NMEA in/out
+// (baudRate little-endian: 0x9600 = 38400.)
+static const uint8_t UBX_CFG_PRT_38400[] = {
     0xB5, 0x62, 0x06, 0x00, 0x14, 0x00,
     0x01,                          // portID = UART1
     0x00,                          // reserved
     0x00, 0x00,                    // txReady
     0xD0, 0x08, 0x00, 0x00,       // mode: 8N1
-    0x00, 0xC2, 0x01, 0x00,       // baudRate: 115200
+    0x00, 0x96, 0x00, 0x00,       // baudRate: 38400
     0x07, 0x00,                    // inProtoMask: UBX+NMEA
     0x03, 0x00,                    // outProtoMask: UBX+NMEA
     0x00, 0x00,                    // flags
     0x00, 0x00,                    // reserved2
-    0xC0, 0x7E                     // checksum
+    0x93, 0x90                     // checksum (Fletcher-8 over class..payload)
 };
 
 // UBX-CFG-MSG: disable sentences we don't parse (saves UART bandwidth)
@@ -64,29 +67,29 @@ void GPSManager::begin() {
     // This works because the NEO-6M outputs NMEA and TinyGPSPlus ignores
     // non-NMEA bytes, so bootloader noise doesn't corrupt parsing.
     _serial = &Serial;
-    _serial->begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+    _serial->begin(GPS_BAUD_DEFAULT, SERIAL_8N1, GPS_RX, GPS_TX);
 
     configureUBX();
 }
 
 void GPSManager::configureUBX() {
-    // 5 Hz rate only makes sense above 9600 baud; skip at default speed
-    if (GPS_BAUD_TARGET > 9600) {
-        sendUBX(UBX_CFG_RATE_5HZ, sizeof(UBX_CFG_RATE_5HZ));
-        delay(100);
-    }
-
     // Strip sentences we don't use to reduce UART load
     sendUBX(UBX_DISABLE_GLL, sizeof(UBX_DISABLE_GLL)); delay(50);
     sendUBX(UBX_DISABLE_GSV, sizeof(UBX_DISABLE_GSV)); delay(50);
     sendUBX(UBX_DISABLE_GSA, sizeof(UBX_DISABLE_GSA)); delay(50);
     sendUBX(UBX_DISABLE_VTG, sizeof(UBX_DISABLE_VTG)); delay(50);
 
+    // Upgrade baud + nav rate together. The 5 Hz path is gated on a non-9600
+    // target because at 9600 the UART can't drain the full RMC+GGA pair
+    // every 200 ms reliably.
     if (GPS_BAUD_TARGET != GPS_BAUD_DEFAULT) {
-        sendUBX(UBX_CFG_PRT_115200, sizeof(UBX_CFG_PRT_115200));
+        sendUBX(UBX_CFG_PRT_38400, sizeof(UBX_CFG_PRT_38400));
         delay(100);
         _serial->end();
         _serial->begin(GPS_BAUD_TARGET, SERIAL_8N1, GPS_RX, GPS_TX);
+        delay(100);
+
+        sendUBX(UBX_CFG_RATE_5HZ, sizeof(UBX_CFG_RATE_5HZ));
         delay(100);
     }
 
@@ -99,6 +102,104 @@ void GPSManager::sendUBX(const uint8_t* msg, size_t len) {
     // Deliberately no flush() — on ESP32-C3, flush() can block indefinitely
     // if TX and RX wires are swapped (bus contention). The modem's 50–100 ms
     // delay after each command is enough for the bytes to drain.
+}
+
+// Fletcher-8 checksum over [startIncl, endExcl); writes 2 bytes at endExcl.
+void GPSManager::appendUbxChecksum(uint8_t* buf, size_t startIncl, size_t endExcl) {
+    uint8_t ckA = 0, ckB = 0;
+    for (size_t i = startIncl; i < endExcl; i++) {
+        ckA = (uint8_t)(ckA + buf[i]);
+        ckB = (uint8_t)(ckB + ckA);
+    }
+    buf[endExcl]     = ckA;
+    buf[endExcl + 1] = ckB;
+}
+
+// ─────────────────────────────────────────────
+// AssistNow / cold-start helpers
+// ─────────────────────────────────────────────
+//
+// UBX-AID-INI (class 0x0B, id 0x01) lets us hand the receiver a coarse
+// position so it doesn't have to download an almanac before searching for
+// satellites. We deliberately omit the time fields here — AssistNow Online
+// carries time data in its own MGA-INI-TIME message, and getting the BCD
+// date encoding wrong here would actually slow the receiver down.
+void GPSManager::injectAidIni(uint32_t /*utcEpoch*/,
+                              double lat, double lon, float altM) {
+    if (lat == 0.0 && lon == 0.0) return;  // no useful seed
+
+    uint8_t pkt[6 + 48 + 2] = {0};
+    pkt[0] = 0xB5; pkt[1] = 0x62;
+    pkt[2] = 0x0B; pkt[3] = 0x01;          // AID-INI
+    pkt[4] = 0x30; pkt[5] = 0x00;          // length = 48
+
+    int32_t latI = (int32_t)(lat * 1e7);
+    int32_t lonI = (int32_t)(lon * 1e7);
+    int32_t altC = (int32_t)(altM * 100.0f);   // cm
+    uint32_t posAcc = 100000UL;                // 1 km, conservative
+
+    // Payload starts at offset 6
+    auto wr32 = [&](size_t o, uint32_t v) {
+        pkt[o]     = (uint8_t)(v);
+        pkt[o + 1] = (uint8_t)(v >> 8);
+        pkt[o + 2] = (uint8_t)(v >> 16);
+        pkt[o + 3] = (uint8_t)(v >> 24);
+    };
+
+    wr32(6,  (uint32_t)latI);   // ecefXOrLat
+    wr32(10, (uint32_t)lonI);   // ecefYOrLon
+    wr32(14, (uint32_t)altC);   // ecefZOrAlt
+    wr32(18, posAcc);           // posAcc
+    // bytes 22..49 stay zero (tmCfg, wnoOrDate, todOrTime, todNs,
+    // tAccMs, tAccNs, clkDOrFreq, clkDAccOrFreqAcc)
+
+    // flags @ offset 50: bit 0 (pos) + bit 9 (lla) = 0x00000201
+    wr32(50, 0x00000201UL);
+
+    appendUbxChecksum(pkt, 2, 6 + 48);
+    sendUBX(pkt, sizeof(pkt));
+    delay(50);
+}
+
+void GPSManager::injectAssistNowBlob(const uint8_t* data, size_t len) {
+    if (!data || len == 0 || !_serial) return;
+
+    // Stream in modest chunks so we don't overrun the UART TX FIFO.
+    const size_t CHUNK = 128;
+    size_t sent = 0;
+    while (sent < len) {
+        size_t n = (len - sent > CHUNK) ? CHUNK : (len - sent);
+        _serial->write(data + sent, n);
+        sent += n;
+        delay(10);
+    }
+}
+
+// ─────────────────────────────────────────────
+// Last-fix persistence (NVS)
+// ─────────────────────────────────────────────
+void GPSManager::saveLastPositionToNVS(double lat, double lon, float altM,
+                                       uint32_t epoch) {
+    gpsPrefs.begin("gps_last", false);
+    gpsPrefs.putDouble("lat", lat);
+    gpsPrefs.putDouble("lon", lon);
+    gpsPrefs.putFloat ("alt", altM);
+    gpsPrefs.putUInt  ("ts",  epoch);
+    gpsPrefs.end();
+}
+
+bool GPSManager::loadLastPositionFromNVS(double* lat, double* lon,
+                                         float* altM, uint32_t* epoch) {
+    gpsPrefs.begin("gps_last", true);
+    bool have = gpsPrefs.isKey("lat");
+    if (have) {
+        if (lat)   *lat   = gpsPrefs.getDouble("lat", 0.0);
+        if (lon)   *lon   = gpsPrefs.getDouble("lon", 0.0);
+        if (altM)  *altM  = gpsPrefs.getFloat ("alt", 0.0f);
+        if (epoch) *epoch = gpsPrefs.getUInt  ("ts",  0);
+    }
+    gpsPrefs.end();
+    return have;
 }
 
 void GPSManager::update() {
