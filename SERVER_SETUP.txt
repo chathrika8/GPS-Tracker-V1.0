@@ -250,16 +250,25 @@ The existing locations table mostly works. Two small changes:
 
 Run this in the Supabase SQL editor:
 
-  -- 1. New columns. Both are nullable, so this won't break old inserts.
+  -- 1. New columns. Both are nullable, so this won't break old inserts
+  --    and existing rows simply have NULL for buf_depth / created_at.
   ALTER TABLE locations
     ADD COLUMN IF NOT EXISTS buf_depth   integer,
-    ADD COLUMN IF NOT EXISTS created_at  timestamptz DEFAULT now();
+    ADD COLUMN IF NOT EXISTS created_at  timestamptz;
 
-  -- 2. Index for "latest fix per device" queries.
+  -- 2. Apply the now() default in a second step. If we did this in step 1,
+  --    Postgres would treat now() as a volatile default and rewrite the
+  --    whole table, stamping every historical row with the same migration
+  --    timestamp — misleading. Splitting it leaves old rows as NULL and
+  --    auto-stamps only future inserts.
+  ALTER TABLE locations
+    ALTER COLUMN created_at SET DEFAULT now();
+
+  -- 3. Index for "latest fix per device" queries.
   CREATE INDEX IF NOT EXISTS locations_device_ts_idx
     ON locations (device_id, timestamp DESC);
 
-  -- 3. Optional: index on created_at for "recent ingestions" dashboards.
+  -- 4. Optional: index on created_at for "recent ingestions" dashboards.
   CREATE INDEX IF NOT EXISTS locations_created_at_idx
     ON locations (created_at DESC);
 
