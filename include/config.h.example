@@ -98,23 +98,21 @@
 #define GPS_UPDATE_RATE   5       // Hz
 
 // ============================================================
-//  AGPS / AssistNow
+//  AGPS — last-known position seed (always free)
 // ============================================================
-// Drops cold-start TTFF from ~45–60 s to ~5 s by injecting time, approximate
-// position, and ephemerides into the NEO-6M before it starts searching.
+// On every boot the firmware injects the last good fix from NVS into the
+// GPS via UBX-AID-INI before satellite search begins. This drops cold-
+// start TTFF from ~45–60 s to ~30 s. It's purely on-device — no token,
+// no network call, no cost.
 //
-// On every boot the firmware does:
-//   1. UBX-AID-INI: UTC from the GSM network + last-known lat/lon from NVS
-//   2. AssistNow Online: HTTP GET via the Cloudflare Worker, stream UBX-MGA-*
-//      bytes straight to the GPS UART
-//
-// Set ASSISTNOW_PATH to a Worker route that fetches
-//   https://online-live1.services.u-blox.com/GetOnlineData.ashx
-//     ?token=<token>;gnss=gps;datatype=eph,alm,aux,pos;
-// and returns the binary body unmodified to the device. The token stays
-// server-side so it never lives on flash.
-#define ASSISTNOW_ENABLE   1
-#define ASSISTNOW_PATH     "/agps"        // Worker route relative to PROXY_HOST
+// AssistNow Online (the u-blox cloud service) is intentionally OFF below.
+// u-blox stopped issuing new tokens on 3 June 2025 and the service ends
+// of support on 31 May 2026. The free replacement (Predictive Orbits)
+// only supports Gen9/Gen10 modules — the NEO-6M is Gen6 so it's not
+// eligible. Leaving ASSISTNOW_ENABLE at 0 saves a pointless boot-time
+// HTTP round-trip that would always fail.
+#define ASSISTNOW_ENABLE   0
+#define ASSISTNOW_PATH     "/agps"        // Worker route, only used if enabled
 #define ASSISTNOW_MAX_LEN  4096           // hard cap on injected bytes
 
 // — Display —

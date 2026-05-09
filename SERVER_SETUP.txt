@@ -45,10 +45,8 @@ The new Worker is a drop-in replacement for the previous one — it:
   WHAT YOU NEED TO PASTE INTO THE WORKER
 -----------------------------------------------------------------
 
-Edit two constants near the top of the file:
+Only ONE thing is mandatory:
 
-  ASSISTNOW_TOKEN   your u-blox AssistNow Online token (sign up
-                    at https://www.thingstream.io, free tier).
   DEVICE_MAP        optional: maps the FNV-1a hash of each device's
                     DEVICE_ID back to the human-readable string.
 
@@ -63,10 +61,25 @@ To compute the hash for "GPS-001":
   '
 
 If a hash isn't in DEVICE_MAP, the Worker stores the raw hex hash in
-device_id so nothing is ever silently dropped.
+device_id so nothing is silently dropped.
 
 The SUPABASE_URL and SUPABASE_KEY constants stay where they were in
 the previous Worker — exactly the same anon key, no rotation needed.
+
+  ASSISTNOW_TOKEN   intentionally left blank. u-blox stopped issuing
+                    new AssistNow Online tokens on 3 June 2025, the
+                    service ends support 31 May 2026, and the free
+                    replacement (Predictive Orbits) only supports
+                    Gen9/Gen10 modules — the NEO-6M is Gen6 and is
+                    NOT eligible. Don't pay anyone for a token; there
+                    isn't a paid tier for the NEO-6M either. Leaving
+                    the constant as the placeholder makes /agps return
+                    503, which is fine because the firmware ships with
+                    ASSISTNOW_ENABLE=0 and never calls the route.
+
+                    The route is left in place so it's trivial to wire
+                    up later if u-blox ever opens a free Gen6-compatible
+                    service, or if you migrate to a Gen9+ receiver.
 
 -----------------------------------------------------------------
   CLOUDFLARE WORKER CODE — paste into worker.js
@@ -327,18 +340,14 @@ exactly identical to your current production rows.
   STEP-BY-STEP DEPLOY
 -----------------------------------------------------------------
 
-  1. Sign up at https://www.thingstream.io for AssistNow Online.
-     Free tier covers ~1000 fetches/day, plenty for one device.
-     Copy the token.
-  2. In Cloudflare → Workers & Pages → your Worker → Edit Code,
+  1. In Cloudflare → Workers & Pages → your Worker → Edit Code,
      replace the contents with the JS block above.
-  3. Paste your AssistNow token into the ASSISTNOW_TOKEN constant.
-     (Optional: fill in DEVICE_MAP with your device IDs.)
-  4. Save and Deploy.
-  5. Smoke tests:
-        curl https://api.<yourdomain>.com/health
-        curl -s https://api.<yourdomain>.com/agps -o agps.bin
-        wc -c agps.bin                 # expect ~3 KB
+  2. Optional: fill in DEVICE_MAP with your device IDs so the dashboard
+     shows "GPS-001" instead of a hex hash.
+  3. Save and Deploy.
+  4. Smoke tests:
+        curl https://api.<yourdomain>.com/health     # → "ok"
+        curl https://api.<yourdomain>.com/agps        # → 503 (expected)
         # Old-format JSON should still ingest:
         curl -X POST https://api.<yourdomain>.com/uplink \
              -H 'Content-Type: application/json' \
@@ -346,9 +355,12 @@ exactly identical to your current production rows.
                   "packets":[{"ts":1714000000,"lat":6.9271,"lon":79.8612,
                   "alt_m":10,"speed_kmh":0,"course":0,"sats":7,
                   "hdop":1.2,"gsm_signal":80,"batt_v":3.9}]}'
-  6. Flash the firmware on this branch and watch the Worker logs
-     (Logs → Live tail). Expect one POST every ~5 s with "OK (5)"
-     and one GET /agps shortly after boot.
+  5. Flash the firmware on this branch and watch the Worker logs
+     (Logs → Live tail). Expect one POST every ~5 s with "OK (5)".
+     /agps will NOT be hit because ASSISTNOW_ENABLE defaults to 0 in
+     the firmware (see "A note on AssistNow" in the README — u-blox
+     killed off the free tier in June 2025 and there is no replacement
+     for the Gen6 NEO-6M).
 
 -----------------------------------------------------------------
   ROLLBACK
