@@ -71,6 +71,7 @@ void DisplayManager::render(const DeviceState& state) {
         case 4: renderUplinkScreen(state); break;
         case 5: renderTcpDebugScreen(state); break;
         case 6: renderModuleDiagsScreen(state); break;
+        case 7: renderMessagesScreen(state); break;
     }
 
     _display->display();
@@ -335,6 +336,119 @@ void DisplayManager::renderModuleDiagsScreen(const DeviceState& state) {
     } else {
         _display->print("[A] Next  [B] ON  WIFI");
     }
+}
+
+// ─────────────────────────────────────────────
+// Screen 7: Messages
+// ─────────────────────────────────────────────
+void DisplayManager::renderMessagesScreen(const DeviceState& state) {
+    if (state.msg_sub_screen == 1) {
+        renderSmsReaderView(state);
+    } else {
+        renderSmsListView(state);
+    }
+}
+
+void DisplayManager::renderSmsListView(const DeviceState& state) {
+    _display->setTextSize(1);
+    _display->setCursor(0, 0);
+    _display->print("MESSAGES [SMS]");
+    if (state.sms_unread_count > 0) {
+        // Draw unread envelope badge
+        int bx = 100;
+        int by = 1;
+        _display->fillRect(bx, by, 11, 8, SH110X_WHITE);
+        _display->drawLine(bx, by, bx+5, by+4, SH110X_BLACK);
+        _display->drawLine(bx+10, by, bx+5, by+4, SH110X_BLACK);
+        _display->setCursor(114, 0);
+        _display->printf("%d", state.sms_unread_count);
+    }
+    _display->drawLine(0, 10, 128, 10, SH110X_WHITE);
+
+    if (state.sms_count == 0) {
+        _display->setCursor(0, 20);
+        _display->print("No messages.");
+    } else {
+        // Display up to 3 messages per page (fitting logic)
+        for (int i = 0; i < 3 && i < state.sms_count; i++) {
+            int y = 14 + (i * 28);
+            
+            int iconX = 0;
+            int iconY = y;
+            if (state.sms_unread[i]) {
+                _display->fillRect(iconX, iconY, 11, 8, SH110X_WHITE);
+                _display->drawLine(iconX, iconY, iconX+5, iconY+4, SH110X_BLACK);
+                _display->drawLine(iconX+10, iconY, iconX+5, iconY+4, SH110X_BLACK);
+            } else {
+                _display->drawRect(iconX, iconY, 11, 8, SH110X_WHITE);
+                _display->drawLine(iconX, iconY, iconX+5, iconY+4, SH110X_WHITE);
+                _display->drawLine(iconX+10, iconY, iconX+5, iconY+4, SH110X_WHITE);
+            }
+            
+            _display->setCursor(15, y);
+            _display->printf("%.7s", state.sms_sender[i]);
+            
+            _display->setCursor(62, y);
+            String ts = String(state.sms_time[i]);
+            if (ts.length() >= 14 && ts.indexOf(',') == 8) {
+                // "26/05/09,16:30:00+22" -> "09/05 16:30"
+                String dd = ts.substring(6, 8);
+                String MM = ts.substring(3, 5);
+                String hhmm = ts.substring(9, 14);
+                _display->print(dd + "/" + MM + " " + hhmm);
+            } else {
+                _display->printf("%.11s", state.sms_time[i]);
+            }
+            
+            _display->setCursor(4, y + 12);
+            _display->printf("%.20s", state.sms_preview[i]);
+            _display->drawLine(0, y + 24, 128, y + 24, SH110X_WHITE);
+        }
+    }
+
+    _display->setCursor(0, 118);
+    _display->print("[A] Next  [B] Read");
+}
+
+void DisplayManager::renderSmsReaderView(const DeviceState& state) {
+    _display->setTextSize(1);
+    
+    if (state.msg_selected_sms >= state.sms_count) {
+        _display->setCursor(0,0);
+        _display->print("Message not found.");
+        _display->setCursor(0, 118);
+        _display->print("[A] Next  [B] Back");
+        return;
+    }
+
+    int idx = state.msg_selected_sms;
+    
+    _display->setCursor(0, 0);
+    _display->printf("FROM: %.14s", state.sms_sender[idx]);
+    _display->setCursor(0, 12);
+    String ts = String(state.sms_time[idx]);
+    if (ts.length() >= 14 && ts.indexOf(',') == 8) {
+        String dd = ts.substring(6, 8);
+        String MM = ts.substring(3, 5);
+        String hhmm = ts.substring(9, 14);
+        _display->print("DATE: " + dd + "/" + MM + " " + hhmm);
+    } else {
+        _display->printf("%.20s", state.sms_time[idx]);
+    }
+    _display->drawLine(0, 22, 128, 22, SH110X_WHITE);
+
+    // Multi-line body
+    _display->setCursor(0, 26);
+    // SH1107 handles simple wrapping if cursor goes past width, but let's just print it.
+    // Width is 128px, char is 6px, so ~21 chars per line.
+    String body = String(state.sms_body[idx]);
+    for(size_t i=0; i<body.length(); i+=21) {
+        _display->setCursor(0, 26 + (i/21)*10);
+        _display->print(body.substring(i, i+21));
+    }
+
+    _display->setCursor(0, 118);
+    _display->printf("[A] Next  [B] NextMsg");
 }
 
 // ── Helpers ──

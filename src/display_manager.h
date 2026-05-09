@@ -17,7 +17,7 @@ private:
     uint8_t _currentScreen = 0;
     bool    _displayOn     = true;
 
-    static const uint8_t NUM_SCREENS = 7;
+    static const uint8_t NUM_SCREENS = 8;
 
     void renderMainScreen(const DeviceState& state);
     void renderGSMScreen(const DeviceState& state);
@@ -26,6 +26,9 @@ private:
     void renderUplinkScreen(const DeviceState& state);
     void renderTcpDebugScreen(const DeviceState& state);
     void renderModuleDiagsScreen(const DeviceState& state);
+    void renderMessagesScreen(const DeviceState& state);
+    void renderSmsListView(const DeviceState& state);
+    void renderSmsReaderView(const DeviceState& state);
 
     void drawSignalBars(int x, int y, int percent, bool animate_loading = false);
     void drawHeader(const DeviceState& state);

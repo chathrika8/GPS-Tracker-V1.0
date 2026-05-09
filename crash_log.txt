@@ -1,0 +1,15 @@
+ESP-ROM:esp32c3-api1-20210207
+Build:Feb  7 2021
+rst:0x7 (TG0WDT_SYS_RST),boot:0xd (SPI_FAST_FLASH_BOOT)
+Saved PC:0x4038bf90
+SPIWP:0xee
+mode:DIO, clock div:1
+load:0x3fcd5810,len:0x438
+load:0x403cc710,len:0x90c
+load:0x403ce710,len:0x2624
+entry 0x403cc710
+E (163) esp_core_dump_flash: No core dump partition found!
+E (164) esp_core_dump_flash: No core dump partition found!
+[   168][I][esp32-hal-i2c.c:75] i2cInit(): Initialising I2C Master: sda=8 scl=9 freq=100000
+[   182][W][Wire.cpp:301] begin(): Bus already started in Master Mode.
+ESP-ROM:esp32c3-api1-20210207

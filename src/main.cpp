@@ -23,6 +23,7 @@
 #include "display_manager.h"
 #include "server_comm.h"
 #include "command_handler.h"
+#include "sms_manager.h"
 #include "schedule_manager.h"
 #include "ota_manager.h"
 #include "button_handler.h"
@@ -117,7 +118,7 @@ void setup() {
     xTaskCreate(gpsTask,      "GPS",      4096, NULL, 3, &gpsTaskHandle);
     xTaskCreate(bufferTask,   "Buffer",   4096, NULL, 2, &bufferTaskHandle);
     xTaskCreate(uplinkTask,   "Uplink",   24576, NULL, 2, &uplinkTaskHandle);
-    xTaskCreate(displayTask,  "Display",  4096, NULL, 1, &displayTaskHandle);
+    xTaskCreate(displayTask,  "Display",  8192, NULL, 1, &displayTaskHandle);
     xTaskCreate(buttonTask,   "Button",   2048, NULL, 1, &buttonTaskHandle);
     xTaskCreate(scheduleTask, "Schedule", 2048, NULL, 1, &scheduleTaskHandle);
 
@@ -243,6 +244,7 @@ void uplinkTask(void* param) {
     }
 
     bool     agpsReseedTried = false;
+    uint32_t lastSmsPoll = 0;  // seeded by smsManager.begin(); prevents immediate poll
     uint32_t lastCellSave    = 0;
     uint32_t lastSendMs      = 0;
 
@@ -285,6 +287,11 @@ void uplinkTask(void* param) {
                 }
             }
             agpsReseedTried = true;
+            
+            // Init SMS config once GSM is up; seed poll timer so we wait
+            // a full 30 s before the first poll (modem needs to settle)
+            smsManager.begin();
+            lastSmsPoll = millis();
         }
 
         // ── Phase 3: periodic cell-tower freshness anchor.
@@ -406,6 +413,19 @@ void uplinkTask(void* param) {
             gsmManager.ensureConnection();
         }
 
+        // ── SMS polling (rate-limited) ──
+        if (connected && lastSmsPoll != 0 && (millis() - lastSmsPoll > 30000)) {
+            serverComm.closeSocket();  // release TCP before raw AT
+            smsManager.pollSms();
+            lastSmsPoll = millis();
+            
+            // Copy SMS data into shared state
+            if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                smsManager.fillState(deviceState);
+                xSemaphoreGive(stateMutex);
+            }
+        }
+
         // Check for manual ping test trigger
         bool triggerPing = false;
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -467,8 +487,36 @@ void buttonTask(void* param) {
                         displayManager.toggleDisplay();
                         break;
                     case BTN_B_SHORT:
+                        if (displayManager.getCurrentScreen() == 7) {
+                            // Cycle sub-screen: 0 (SMS list) -> 1 (SMS reader) -> 0
+                            if (deviceState.msg_sub_screen == 0 && deviceState.sms_count > 0) {
+                                deviceState.msg_sub_screen = 1;  // open reader
+                                deviceState.msg_selected_sms = 0;
+                                
+                                smsManager.markRead(0);
+                                if (deviceState.sms_unread[0]) {
+                                    deviceState.sms_unread[0] = false;
+                                    if (deviceState.sms_unread_count > 0) deviceState.sms_unread_count--;
+                                }
+                            } else if (deviceState.msg_sub_screen == 1) {
+                                // Next SMS or switch back to list
+                                if (deviceState.msg_selected_sms + 1 < deviceState.sms_count) {
+                                    deviceState.msg_selected_sms++;
+                                    
+                                    smsManager.markRead(deviceState.msg_selected_sms);
+                                    if (deviceState.sms_unread[deviceState.msg_selected_sms]) {
+                                        deviceState.sms_unread[deviceState.msg_selected_sms] = false;
+                                        if (deviceState.sms_unread_count > 0) deviceState.sms_unread_count--;
+                                    }
+                                } else {
+                                    deviceState.msg_sub_screen = 0;  // back to SMS list
+                                }
+                            } else {
+                                deviceState.msg_sub_screen = 0;
+                            }
+                        }
                         // Trigger Connectivity Test (Ping)
-                        if (displayManager.getCurrentScreen() == 4) {
+                        else if (displayManager.getCurrentScreen() == 4) {
                              deviceState.trigger_ping_test = true;
                         } else if (displayManager.getCurrentScreen() == 6) {
                              if (deviceState.wifi_enabled) {
@@ -479,8 +527,12 @@ void buttonTask(void* param) {
                         }
                         break;
                     case BTN_B_LONG:
-                        // Enter deep sleep
-                        powerManager.enterDeepSleep(0); // 0 = no timed wake
+                        if (displayManager.getCurrentScreen() == 7 && deviceState.msg_sub_screen == 1) {
+                            deviceState.msg_sub_screen = 0; // back to list
+                        } else {
+                            // Enter deep sleep
+                            powerManager.enterDeepSleep(0); // 0 = no timed wake
+                        }
                         break;
                     default:
                         break;
