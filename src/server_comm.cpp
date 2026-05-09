@@ -2,6 +2,25 @@
 #include "config.h"
 #include <ArduinoJson.h>
 
+// ── Fallback defaults ──
+// These let the firmware compile against an older config.h that pre-dates
+// the v1.1.0 tunables. Override them in include/config.h for production use.
+#ifndef PAYLOAD_PROFILE_COMPACT
+#define PAYLOAD_PROFILE_COMPACT  1
+#endif
+#ifndef PAYLOAD_PROFILE_FULL
+#define PAYLOAD_PROFILE_FULL     2
+#endif
+#ifndef PAYLOAD_PROFILE
+#define PAYLOAD_PROFILE          PAYLOAD_PROFILE_COMPACT
+#endif
+#ifndef UPLINK_KEEPALIVE_MAX_AGE_MS
+#define UPLINK_KEEPALIVE_MAX_AGE_MS  60000
+#endif
+#ifndef ASSISTNOW_PATH
+#define ASSISTNOW_PATH  "/agps"
+#endif
+
 ServerComm serverComm;
 
 void ServerComm::begin() {}

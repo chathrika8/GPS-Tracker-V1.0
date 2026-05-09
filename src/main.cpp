@@ -27,6 +27,16 @@
 #include "button_handler.h"
 #include "power_manager.h"
 
+// ── Fallback defaults for v1.1.0 macros ──
+// Override in include/config.h to tune; these just keep the build green
+// against older config.h files that pre-date the AGPS additions.
+#ifndef ASSISTNOW_ENABLE
+#define ASSISTNOW_ENABLE   1
+#endif
+#ifndef ASSISTNOW_MAX_LEN
+#define ASSISTNOW_MAX_LEN  4096
+#endif
+
 // ── Shared device state (mutex-protected) ──
 DeviceState deviceState;
 SemaphoreHandle_t stateMutex;
