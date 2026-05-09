@@ -202,10 +202,179 @@ bool GPSManager::loadLastPositionFromNVS(double* lat, double* lon,
     return have;
 }
 
+// ─────────────────────────────────────────────
+// UBX parser implementation
+// ─────────────────────────────────────────────
+void UbxParser::reset() {
+    _st = S_S1;
+    _cls = _id = 0;
+    _len = _idx = 0;
+    _ckA = _ckB = _expCkA = 0;
+    _ready = false;
+}
+
+void UbxParser::onByte(uint8_t b) {
+    if (_ready) return;   // wait for consumeFrame()
+    switch (_st) {
+        case S_S1:
+            if (b == 0xB5) { _buf[0] = b; _st = S_S2; }
+            break;
+        case S_S2:
+            if (b == 0x62) { _buf[1] = b; _st = S_CLS; }
+            else           { reset(); }
+            break;
+        case S_CLS:
+            _cls = b; _buf[2] = b;
+            _ckA = b; _ckB = b;
+            _st = S_ID;
+            break;
+        case S_ID:
+            _id = b;  _buf[3] = b;
+            _ckA = (uint8_t)(_ckA + b);  _ckB = (uint8_t)(_ckB + _ckA);
+            _st = S_LL;
+            break;
+        case S_LL:
+            _len = b; _buf[4] = b;
+            _ckA = (uint8_t)(_ckA + b);  _ckB = (uint8_t)(_ckB + _ckA);
+            _st = S_LH;
+            break;
+        case S_LH:
+            _len |= ((uint16_t)b << 8);  _buf[5] = b;
+            _ckA = (uint8_t)(_ckA + b);  _ckB = (uint8_t)(_ckB + _ckA);
+            if (_len > sizeof(_buf) - 8) { reset(); break; }
+            _idx = 0;
+            _st  = (_len == 0) ? S_KA : S_PL;
+            break;
+        case S_PL:
+            _buf[6 + _idx] = b;
+            _ckA = (uint8_t)(_ckA + b);  _ckB = (uint8_t)(_ckB + _ckA);
+            if (++_idx >= _len) _st = S_KA;
+            break;
+        case S_KA:
+            _expCkA = b; _buf[6 + _len] = b;
+            _st = S_KB;
+            break;
+        case S_KB:
+            _buf[7 + _len] = b;
+            if (_expCkA == _ckA && b == _ckB) _ready = true;
+            else                              reset();
+            break;
+    }
+}
+
+void UbxParser::consumeFrame(uint8_t* out, size_t* outLen) {
+    size_t total = (size_t)8 + _len;
+    if (out && outLen) {
+        size_t cap  = *outLen;
+        size_t copy = (total > cap) ? cap : total;
+        memcpy(out, _buf, copy);
+        *outLen = total;
+    }
+    reset();
+}
+
+// ─────────────────────────────────────────────
+// Reader: feeds bytes to NMEA parser AND UBX parser
+// ─────────────────────────────────────────────
 void GPSManager::update() {
     while (_serial->available() > 0) {
-        _gps.encode(_serial->read());
+        uint8_t b = (uint8_t)_serial->read();
+        _gps.encode((char)b);
+        _ubx.onByte(b);
+        if (_ubx.hasFullFrame()) onUbxFrameReady();
     }
+
+    // If a poll opened the capture window > 2 s ago, close it. The replies
+    // trickle in over ~1 s at 38400 baud, so 2 s is a safe upper bound.
+    if (_capturingEph && (millis() - _ephCaptureStart) > 2000) {
+        _capturingEph = false;
+    }
+}
+
+void GPSManager::onUbxFrameReady() {
+    // Only AID-EPH (class 0x0B, id 0x31) with a *full* 104-byte payload is
+    // worth caching — the 1-byte form is the receiver telling us "I have no
+    // ephemeris for this SV", which is useless to replay.
+    bool isFullEph = _capturingEph
+                  && _ubx.getCls() == 0x0B
+                  && _ubx.getId()  == 0x31
+                  && _ubx.getLen() >= 100;
+    if (isFullEph) {
+        size_t  total  = (size_t)8 + _ubx.getLen();
+        if (_ephLen + total <= sizeof(_ephBuf)) {
+            size_t lenOut = sizeof(_ephBuf) - _ephLen;
+            _ubx.consumeFrame(_ephBuf + _ephLen, &lenOut);
+            _ephLen += total;
+            _ephCount++;
+            return;
+        }
+    }
+    // Discard frame
+    uint8_t scratch[120]; size_t s = sizeof(scratch);
+    _ubx.consumeFrame(scratch, &s);
+}
+
+void GPSManager::pollEphemerides() {
+    // UBX-AID-EPH poll-all (no payload) — receiver replies with one frame
+    // per SV: full 104 B if it has ephemeris, else 1 B (just SVID).
+    static const uint8_t POLL[] = { 0xB5, 0x62, 0x0B, 0x31, 0x00, 0x00, 0x3C, 0xBF };
+    _ephLen          = 0;
+    _ephCount        = 0;
+    _capturingEph    = true;
+    _ephCaptureStart = millis();
+    sendUBX(POLL, sizeof(POLL));
+}
+
+int GPSManager::saveEphemeridesToNVS(uint32_t nowEpoch) {
+    _capturingEph = false;
+    if (_ephCount == 0 || _ephLen == 0) return 0;
+
+    gpsPrefs.begin("gps_eph", false);
+    gpsPrefs.putBytes("blob",  _ephBuf, _ephLen);
+    gpsPrefs.putUShort("len",   (uint16_t)_ephLen);
+    gpsPrefs.putUChar ("count", _ephCount);
+    gpsPrefs.putUInt  ("ts",    nowEpoch);
+    gpsPrefs.end();
+    return _ephCount;
+}
+
+int GPSManager::replayEphemeridesFromNVS(uint32_t nowEpoch, uint32_t maxAgeSec) {
+    gpsPrefs.begin("gps_eph", true);
+    if (!gpsPrefs.isKey("blob")) { gpsPrefs.end(); return 0; }
+
+    uint32_t saved = gpsPrefs.getUInt("ts", 0);
+    if (nowEpoch && saved && (nowEpoch - saved) > maxAgeSec) {
+        gpsPrefs.end();
+        return 0;   // too stale; the receiver would just discard them anyway
+    }
+    if (nowEpoch == 0) {
+        // No clock yet — replay anyway. Worst case the receiver rejects them
+        // and we fall back to standard cold-start behaviour.
+    }
+
+    size_t len = gpsPrefs.getUShort("len", 0);
+    if (len == 0 || len > sizeof(_ephBuf)) { gpsPrefs.end(); return 0; }
+    gpsPrefs.getBytes("blob", _ephBuf, len);
+    int count = gpsPrefs.getUChar("count", 0);
+    gpsPrefs.end();
+
+    // Each saved frame is a complete UBX packet — sync, header, payload, csum.
+    // Walk the buffer and forward each one. The 20 ms sleep gives the
+    // receiver time to process before the next frame.
+    size_t off = 0;
+    int    sent = 0;
+    while (off + 8 <= len) {
+        if (_ephBuf[off] != 0xB5 || _ephBuf[off + 1] != 0x62) break;
+        uint16_t flen = (uint16_t)_ephBuf[off + 4]
+                     | ((uint16_t)_ephBuf[off + 5] << 8);
+        size_t total = (size_t)8 + flen;
+        if (off + total > len) break;
+        sendUBX(_ephBuf + off, total);
+        off += total;
+        sent++;
+        delay(20);
+    }
+    return (sent > 0) ? count : 0;
 }
 
 void GPSManager::fillState(DeviceState& state) {

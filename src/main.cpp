@@ -196,18 +196,47 @@ void uplinkTask(void* param) {
 
         // ── AGPS bring-up: run once when GPRS first comes up ──
         if (connected && !agpsDone) {
-            // Seed receiver with last-known position from NVS
-            double lastLat = 0, lastLon = 0;
-            float  lastAlt = 0;
-            uint32_t lastTs = 0;
-            if (gpsManager.loadLastPositionFromNVS(&lastLat, &lastLon, &lastAlt, &lastTs)) {
-                Serial.printf("[AGPS] Seeding AID-INI with %.5f,%.5f\n", lastLat, lastLon);
-                uint32_t utc = gsmManager.getNetworkUtcEpoch();
-                gpsManager.injectAidIni(utc, lastLat, lastLon, lastAlt);
+            // Step 1: pick the best position seed available.
+            //  - Prefer the last saved fix from NVS (sub-km accurate).
+            //  - Fall back to AT+CIPGSMLOC cell-tower lookup (~1–5 km).
+            //  - If both fail (first-ever boot in poor coverage) skip the
+            //    AID-INI position seed; the receiver will cold-start as usual.
+            double seedLat = 0, seedLon = 0;
+            float  seedAlt = 0;
+            uint32_t seedTs = 0;
+            const char* seedSrc = nullptr;
+
+            if (gpsManager.loadLastPositionFromNVS(&seedLat, &seedLon, &seedAlt, &seedTs)) {
+                seedSrc = "NVS";
+            } else if (gsmManager.getCellLocation(&seedLat, &seedLon)) {
+                seedAlt = 0;
+                seedSrc = "CELL";
+            }
+
+            uint32_t utc = gsmManager.getNetworkUtcEpoch();
+
+            if (seedSrc) {
+                Serial.printf("[AGPS] AID-INI seed (%s): %.5f,%.5f\n",
+                              seedSrc, seedLat, seedLon);
+                gpsManager.injectAidIni(utc, seedLat, seedLon, seedAlt);
+            } else {
+                Serial.println("[AGPS] No position seed available — cold start");
+            }
+
+            // Step 2: replay any ephemerides we cached on a previous run.
+            // The 3-hour validity matches the GPS broadcast ephemeris window.
+            int replayed = gpsManager.replayEphemeridesFromNVS(utc, 3 * 3600);
+            if (replayed > 0) {
+                Serial.printf("[AGPS] Replayed %d cached ephemerides\n", replayed);
+                if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    deviceState.agps_injected = true;
+                    deviceState.agps_bytes    = (uint16_t)(replayed * 112);
+                    xSemaphoreGive(stateMutex);
+                }
             }
 
 #if ASSISTNOW_ENABLE
-            // Pull AssistNow Online via the Worker; stream straight to GPS UART.
+            // AssistNow Online (disabled by default — see config.h.example).
             static uint8_t agpsBuf[ASSISTNOW_MAX_LEN];
             size_t agpsLen = 0;
             if (serverComm.fetchAssistNow(agpsBuf, sizeof(agpsBuf), &agpsLen) && agpsLen > 0) {
@@ -219,8 +248,6 @@ void uplinkTask(void* param) {
                     deviceState.agps_bytes    = (uint16_t)agpsLen;
                     xSemaphoreGive(stateMutex);
                 }
-            } else {
-                Serial.println("[AGPS] AssistNow fetch failed — relying on AID-INI seed only");
             }
 #endif
             agpsDone = true;
@@ -296,6 +323,30 @@ void uplinkTask(void* param) {
                 if (sent > 0) {
                     // After successful send, poll for commands
                     commandHandler.pollAndExecute();
+
+                    // ── Refresh local ephemeris cache (≤ once per 30 min) ──
+                    // We only need a strong fix; the 6-sat threshold avoids
+                    // wasting flash writes on partial constellations.
+                    static uint32_t lastEphPoll = 0;
+                    bool   fixGood = false;
+                    uint32_t nowEpoch = 0;
+                    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        fixGood  = deviceState.gps_fix && deviceState.satellites >= 6;
+                        nowEpoch = deviceState.utc_epoch;
+                        xSemaphoreGive(stateMutex);
+                    }
+                    bool due = (lastEphPoll == 0)
+                            || (millis() - lastEphPoll > 30UL * 60UL * 1000UL);
+                    if (fixGood && due) {
+                        Serial.println("[GPS] Polling ephemerides for NVS cache");
+                        gpsManager.pollEphemerides();
+                        // Replies trickle in over ~1 s at 38 400 baud; 2 s
+                        // is a safe ceiling. update() does the capturing.
+                        vTaskDelay(pdMS_TO_TICKS(2000));
+                        int saved = gpsManager.saveEphemeridesToNVS(nowEpoch);
+                        Serial.printf("[GPS] Cached %d ephemerides\n", saved);
+                        lastEphPoll = millis();
+                    }
                 }
             }
         } else {

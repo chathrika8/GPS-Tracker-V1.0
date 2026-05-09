@@ -95,6 +95,25 @@ void GSMManager::resetModem() {
     }
 }
 
+// Cell-tower position via AT+CIPGSMLOC. Requires GPRS to be up because the
+// SIM800 firmware reaches out to the cell-tower DB itself over the bearer.
+// The TinyGsm getGsmLocation() signature takes lon BEFORE lat (gotcha).
+bool GSMManager::getCellLocation(double* lat, double* lon) {
+    if (!_modem || !lat || !lon) return false;
+    if (!_modem->isGprsConnected()) return false;
+
+    float fLat = 0, fLon = 0, fAcc = 0;
+    int   yr = 0, mo = 0, dy = 0, hr = 0, mi = 0, sc = 0;
+    if (!_modem->getGsmLocation(&fLon, &fLat, &fAcc,
+                                &yr, &mo, &dy, &hr, &mi, &sc)) {
+        return false;
+    }
+    if (fLat == 0.0f && fLon == 0.0f) return false;
+    *lat = (double)fLat;
+    *lon = (double)fLon;
+    return true;
+}
+
 // Parse AT+CCLK response into a UTC epoch. Returns 0 if not synchronised.
 // CCLK format: "yy/MM/dd,HH:mm:ss±zz" where zz is the offset in quarter-hours.
 uint32_t GSMManager::getNetworkUtcEpoch() {
