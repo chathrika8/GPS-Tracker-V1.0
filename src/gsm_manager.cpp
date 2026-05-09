@@ -84,7 +84,53 @@ void GSMManager::resetModem() {
     digitalWrite(SIM800L_RST, LOW);
     delay(150);
     digitalWrite(SIM800L_RST, HIGH);
-    delay(3000);  // SIM800L needs ~3 s to boot after PWRKEY pulse
+
+    // Poll for the modem coming up rather than blocking 3 s unconditionally.
+    // SIM800L typically responds in ~1.2 s but worst-case is ~3 s, so cap
+    // the wait there. Saves ~1.5–2 s on the typical boot.
+    unsigned long deadline = millis() + 3000;
+    while (millis() < deadline) {
+        if (_modem->testAT(200)) return;
+        delay(100);
+    }
+}
+
+// Parse AT+CCLK response into a UTC epoch. Returns 0 if not synchronised.
+// CCLK format: "yy/MM/dd,HH:mm:ss±zz" where zz is the offset in quarter-hours.
+uint32_t GSMManager::getNetworkUtcEpoch() {
+    if (!_modem) return 0;
+
+    int   year, month, day, hour, minute, second;
+    float tz;
+    if (!_modem->getNetworkTime(&year, &month, &day,
+                                &hour, &minute, &second, &tz)) {
+        return 0;
+    }
+
+    // Convert local time to UTC by subtracting the timezone offset (hours)
+    long offsetSec = (long)(tz * 3600.0f);
+
+    // Days from epoch (1970-01-01) to year-month-day
+    uint32_t days = 0;
+    for (int y = 1970; y < year; y++) {
+        bool leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+        days += leap ? 366 : 365;
+    }
+    static const int dpm[] = { 0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    bool leapYear = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+    for (int m = 1; m < month; m++) {
+        days += dpm[m];
+        if (m == 2 && leapYear) days++;
+    }
+    days += day - 1;
+
+    long epoch = (long)days * 86400L
+               + (long)hour   * 3600L
+               + (long)minute * 60L
+               + (long)second
+               - offsetSec;
+    if (epoch < 0) return 0;
+    return (uint32_t)epoch;
 }
 
 void GSMManager::setAlarm(const char* datetime) {

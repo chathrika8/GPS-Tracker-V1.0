@@ -83,8 +83,11 @@ GPIO  1       ──► Button B (BACK / HANG)
 ## Features
 
 - **Real-time GPS** at up to 5 Hz with TinyGPSPlus (latitude, longitude, altitude, speed, course, HDOP, satellites)
-- **GSM/GPRS data uplink** to a Cloudflare-proxied REST API backed by Supabase
-- **Speed-adaptive bufferring** - 10 s packet interval moving or idle
+- **AssistNow / AGPS** - cold-start TTFF dropped from ~45–60 s to ~1–5 s by injecting last-known position (NVS) and live u-blox MGA data via the Cloudflare Worker on every boot
+- **GSM/GPRS data uplink** to a Cloudflare-proxied REST API backed by Supabase, using a persistent HTTP/1.1 keep-alive socket so each batch skips the 2G TCP handshake
+- **Two wire formats** - compact binary (~20 B/packet) or short-key JSON (~80 B/packet), selectable from `config.h` so the same firmware can A/B test both on the same Worker
+- **Speed-adaptive buffering** - 1 Hz packets when moving, 15 s when stationary
+- **Adaptive batching** - uplinks fire as soon as a 5-packet batch is ready, with a 5 s flush ceiling so motion reaches the server within seconds
 - **LittleFS packet buffer** - stores up to 2,000 compact binary packets (≈ 48 bytes each) in flash; survives power loss
 - **7-screen OLED UI** - main telemetry, GSM status, coordinates, system info, uplink diagnostics, TCP debug, module diags
 - **Two-button navigation** - short/long press actions per screen
@@ -109,9 +112,9 @@ GPIO  1       ──► Button B (BACK / HANG)
 │  │ gpsTask     │  Parses NMEA, fills DeviceState            │
 │  └─────────────┘                                           │
 │                                                             │
-│  ┌─────────────┐  Priority 2  Buffer Task   (10 s tick)    │
+│  ┌─────────────┐  Priority 2  Buffer Task  (1 s / 15 s)    │
 │  │ bufferTask  │  Writes GPSPacket to LittleFS              │
-│  └─────────────┘                                           │
+│  └─────────────┘  (1 Hz when moving, 15 s when idle)        │
 │                                                             │
 │  ┌─────────────┐  Priority 2  Uplink Task   (continuous)   │
 │  │ uplinkTask  │  GSM init → GPRS drain → command poll      │
@@ -191,7 +194,14 @@ Then edit `include/config.h`:
 
 // - Device Identity -
 #define DEVICE_ID     "GPS-001"
-#define FW_VERSION    "1.0.0"
+#define FW_VERSION    "1.1.0"
+
+// - Wire format - 1=binary (default, smallest), 2=short-key JSON
+#define PAYLOAD_PROFILE  PAYLOAD_PROFILE_COMPACT
+
+// - AssistNow / AGPS - HTTP route on PROXY_HOST that fetches u-blox AssistNow
+#define ASSISTNOW_ENABLE  1
+#define ASSISTNOW_PATH    "/agps"
 ```
 
 All other timing and pin constants are safe defaults and can be left as-is.
@@ -300,6 +310,59 @@ CREATE TABLE locations (
 4. Update `PROXY_HOST` and `PROXY_PATH` in `config.h` to match your Worker's hostname and route.
 
 The uplink pipeline is **fire-and-forget** - sent packets are immediately removed from the buffer. There is no retry queue, ensuring old data is never re-uploaded after a long connectivity outage.
+
+#### Wire Format Profiles
+
+Two payload formats are supported so both can be benchmarked on the same Worker. Select via `PAYLOAD_PROFILE` in `config.h`.
+
+**`PAYLOAD_PROFILE_COMPACT`** (default) — `Content-Type: application/octet-stream`, 11 B header + 20 B/packet:
+
+```
+Header (11 B):
+  [0]    'G' magic
+  [1]    0x01 version
+  [2..5] device_id_hash  (FNV-1a of DEVICE_ID, uint32 LE)
+  [6..9] buf_count       (uint32 LE — queue depth at send time)
+  [10]   packet_count    (uint8)
+
+Packet (20 B, repeated packet_count times):
+  [0..3]   ts        uint32 LE   UTC epoch
+  [4..7]   lat       int32  LE   degrees × 1e7
+  [8..11]  lon       int32  LE   degrees × 1e7
+  [12..13] alt       int16  LE   metres
+  [14]     speed     uint8       km/h × 2  (0–127.5 km/h)
+  [15]     course    uint8       degrees / 2
+  [16]     sats      uint8
+  [17]     hdop      uint8       × 10  (0.0–25.5)
+  [18]     gsm       uint8       %
+  [19]     batt      uint8       (V − 3.0) × 100  (3.00–5.55 V)
+```
+
+**`PAYLOAD_PROFILE_FULL`** — `Content-Type: application/json`, short-key envelope:
+
+```json
+{"d":"GPS-001","f":"1.1.0","b":12,"p":[[ts,lat,lon,alt,sp,co,sa,hd,gs,bv]]}
+```
+
+A 5-packet batch is ~110 B (binary) vs ~430 B (short-key JSON) vs ~1500 B (the original verbose JSON), excluding HTTP headers.
+
+#### Keep-Alive Socket
+
+The firmware opens **one** TCP socket to the Worker and reuses it for up to `UPLINK_KEEPALIVE_MAX_AGE_MS` (default 60 s). Headers send `Connection: keep-alive`. This skips the ~5–10 s 2G TCP handshake on every uplink after the first, which is the dominant latency on SIM800 GPRS.
+
+#### AssistNow / AGPS Setup
+
+The NEO-6M cold-starts in 45–60 s without assistance. The firmware uses two helpers to drop this to ~1–5 s:
+
+1. **UBX-AID-INI position seed** — the last valid fix is persisted to NVS once a minute. On boot, that lat/lon is injected into the receiver before satellite search begins.
+2. **AssistNow Online** — on each boot, after GPRS comes up, the firmware does `GET <PROXY_HOST><ASSISTNOW_PATH>` and streams the binary response directly to the GPS UART.
+
+The Worker route at `ASSISTNOW_PATH` (default `/agps`) is expected to:
+- Sign in to your u-blox AssistNow account (free tier available at [thingstream.io](https://www.thingstream.io/))
+- Fetch `https://online-live1.services.u-blox.com/GetOnlineData.ashx?token=<YOUR_TOKEN>;gnss=gps;datatype=eph,alm,aux,pos;`
+- Return the binary body unmodified to the device
+
+The token stays server-side so it never lives in firmware. Set `ASSISTNOW_ENABLE 0` in `config.h` to disable the fetch (the AID-INI position seed still runs).
 
 ### OTA Updates (GitHub + Supabase)
 

@@ -18,6 +18,10 @@ public:
     bool isRegistered();
     String getOperator();
 
+    // Network UTC via AT+CCLK. Returns 0 if not yet synced.
+    // Used to seed UBX-AID-INI before GPS cold-start.
+    uint32_t getNetworkUtcEpoch();
+
     // HTTP methods via TinyGSM
     TinyGsmClient& getClient();
     TinyGsm&       getModem();
