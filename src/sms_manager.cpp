@@ -110,18 +110,27 @@ void SmsManager::pollSms() {
     int toDelete[20];
     int deleteCount = 0;
 
-    // Use static buffers so they are never on the heap
-    static char lineBuf[256];
-    static char bodyBuf[256];
+    // Static so the buffers don't sit on the uplinkTask stack. A 160-char
+    // UCS2 body is 640 hex chars, so the line buffer must be at least that.
+    static char lineBuf[700];
+    static char bodyBuf[700];
+
+    // Tighten the Stream timeout for the duration of this poll. The default
+    // 1000 ms means readBytesUntil() can spin without yielding for a full
+    // second per partial line, which on the ESP32-C3 starves the IDLE task
+    // and trips the system watchdog (rst:0x7 TG0WDT_SYS_RST). Restore on exit.
+    unsigned long prevTimeout = modem.stream.getTimeout();
+    modem.stream.setTimeout(50);
 
     modem.sendAT(GF("+CMGL=\"ALL\""));
 
     unsigned long timeout = millis() + 10000;
     while (millis() < timeout) {
-        if (!modem.stream.available()) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
+        // Yield once per iteration so IDLE always gets a slice while we
+        // drain the +CMGL listing.
+        vTaskDelay(pdMS_TO_TICKS(1));
+
+        if (!modem.stream.available()) continue;
 
         size_t len = modem.stream.readBytesUntil('\n', lineBuf, sizeof(lineBuf) - 1);
         lineBuf[len] = '\0';
@@ -158,8 +167,11 @@ void SmsManager::pollSms() {
         }
         if (e->unread) _unreadSmsCount++;
 
-        // ── Sender (3rd quoted token) ─────────────────────────────────────────
-        extractQuoted(lineBuf, 3, e->sender, sizeof(e->sender));
+        // ── Sender (2nd quoted token: <oa>/<da>) ──────────────────────────────
+        // +CMGL: <idx>,"<stat>","<oa>",[<alpha>],"<scts>" — when <alpha> is
+        // empty (no SIM phonebook match) the 3rd quoted token is the
+        // timestamp, not the sender.
+        extractQuoted(lineBuf, 2, e->sender, sizeof(e->sender));
 
         // ── Timestamp (last quoted token) ─────────────────────────────────────
         extractLastQuoted(lineBuf, e->timestamp, sizeof(e->timestamp));
@@ -168,10 +180,9 @@ void SmsManager::pollSms() {
         unsigned long bodyTimeout = millis() + 1000;
         bool gotBody = false;
         while (millis() < bodyTimeout && !gotBody) {
-            if (!modem.stream.available()) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
+            vTaskDelay(pdMS_TO_TICKS(1));
+            if (!modem.stream.available()) continue;
+
             size_t bLen = modem.stream.readBytesUntil('\n', bodyBuf, sizeof(bodyBuf) - 1);
             bodyBuf[bLen] = '\0';
             trimBuf(bodyBuf);
@@ -186,6 +197,8 @@ void SmsManager::pollSms() {
             }
         }
     }
+
+    modem.stream.setTimeout(prevTimeout);
 
     // Delete overflow messages from the SIM card
     for (int i = 0; i < deleteCount; i++) {
