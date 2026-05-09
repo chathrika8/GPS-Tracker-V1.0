@@ -14,7 +14,10 @@ struct SmsEntry {
 class SmsManager {
 public:
     void begin();
-    void pollSms();
+    // Returns true if the +CMGL listing completed cleanly. On any failure
+    // (modem not responding, ERROR, half-parsed entry, etc.) the previously
+    // cached SMS list is left untouched so callers can simply retry later.
+    bool pollSms();
     
     void fillState(DeviceState& state);
     void markRead(int stateIndex);

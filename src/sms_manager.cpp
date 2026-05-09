@@ -84,109 +84,138 @@ static bool extractLastQuoted(const char* line, char* out, size_t outLen) {
 
 // ── SmsManager methods ───────────────────────────────────────────────────────
 
+// Drain leftover bytes from the modem stream so subsequent AT commands
+// don't trip on stale data. Bounded so it can never spin.
+static void drainStream(TinyGsm& modem, uint32_t budgetMs) {
+    unsigned long deadline = millis() + budgetMs;
+    while ((long)(millis() - deadline) < 0) {
+        if (!modem.stream.available()) return;
+        modem.stream.read();
+    }
+}
+
 void SmsManager::begin() {
     LOG("[SMS] Configuring modem for SMS...");
     TinyGsm& modem = gsmManager.getModem();
+
     modem.sendAT(GF("+CMGF=1"));         // Text mode
-    modem.waitResponse();
+    if (modem.waitResponse(1000) != 1) {
+        LOG("[SMS] +CMGF=1 not acknowledged — polling will be skipped");
+    }
     modem.sendAT(GF("+CSCS=\"GSM\""));   // GSM character set
-    modem.waitResponse();
+    if (modem.waitResponse(1000) != 1) {
+        LOG("[SMS] +CSCS not acknowledged");
+    }
 }
 
-void SmsManager::pollSms() {
+bool SmsManager::pollSms() {
     LOG("[SMS] Polling messages...");
     TinyGsm& modem = gsmManager.getModem();
 
-    // Snapshot old buffer to restore unread states after re-poll
-    // Static so it never goes on the task stack
-    static SmsEntry oldBuffer[MAX_SMS];
-    int oldSmsCount = _smsCount;
-    memcpy(oldBuffer, _smsBuffer, sizeof(_smsBuffer));
-
-    _smsCount = 0;
-    _unreadSmsCount = 0;
-    memset(_smsBuffer, 0, sizeof(_smsBuffer));
+    // Parse into workBuffer; only commit to _smsBuffer on success so a
+    // partial / failed poll never overwrites the cached list.
+    static SmsEntry workBuffer[MAX_SMS];
+    memset(workBuffer, 0, sizeof(workBuffer));
+    uint8_t newSmsCount    = 0;
+    uint8_t newUnreadCount = 0;
 
     int toDelete[20];
     int deleteCount = 0;
 
-    // Static so the buffers don't sit on the uplinkTask stack. A 160-char
-    // UCS2 body is 640 hex chars, so the line buffer must be at least that.
+    // Static buffers — kept off the uplinkTask stack. A 160-char UCS2 body
+    // is 640 hex chars, so the line buffer must be at least that.
     static char lineBuf[700];
     static char bodyBuf[700];
 
-    // Tighten the Stream timeout for the duration of this poll. The default
-    // 1000 ms means readBytesUntil() can spin without yielding for a full
-    // second per partial line, which on the ESP32-C3 starves the IDLE task
-    // and trips the system watchdog (rst:0x7 TG0WDT_SYS_RST). Restore on exit.
+    // Tighten the Stream timeout so readBytesUntil can't spin for a full
+    // second per partial line. Restored on every exit path.
     unsigned long prevTimeout = modem.stream.getTimeout();
     modem.stream.setTimeout(50);
 
     modem.sendAT(GF("+CMGL=\"ALL\""));
 
-    unsigned long timeout = millis() + 10000;
-    while (millis() < timeout) {
-        // Yield once per iteration so IDLE always gets a slice while we
-        // drain the +CMGL listing.
+    const unsigned long deadline          = millis() + 8000;
+    const unsigned long firstByteDeadline = millis() + 2000;
+    bool sawAnyByte    = false;
+    bool gotTerminator = false;
+    bool sawError      = false;
+
+    while ((long)(millis() - deadline) < 0) {
         vTaskDelay(pdMS_TO_TICKS(1));
 
-        if (!modem.stream.available()) continue;
+        if (!modem.stream.available()) {
+            // Modem hasn't said anything at all — abort early so we don't
+            // burn the full 8 s budget when the radio is unhappy.
+            if (!sawAnyByte && (long)(millis() - firstByteDeadline) >= 0) {
+                LOG("[SMS] No response from modem, aborting");
+                break;
+            }
+            continue;
+        }
+        sawAnyByte = true;
 
         size_t len = modem.stream.readBytesUntil('\n', lineBuf, sizeof(lineBuf) - 1);
         lineBuf[len] = '\0';
         trimBuf(lineBuf);
+        if (lineBuf[0] == '\0') continue;
 
-        if (strcmp(lineBuf, "OK") == 0 || strcmp(lineBuf, "ERROR") == 0) break;
-        if (strncmp(lineBuf, "+CMGL:", 6) != 0) continue;
-
-        // ── Parse SIM index ──────────────────────────────────────────────────
-        int simIdx = atoi(lineBuf + 7);
-
-        // ── Allocate slot ────────────────────────────────────────────────────
-        SmsEntry* e;
-        if (_smsCount < MAX_SMS) {
-            e = &_smsBuffer[_smsCount++];
-        } else {
-            if (deleteCount < 20) toDelete[deleteCount++] = _smsBuffer[0].index;
-            for (int i = 0; i < MAX_SMS - 1; i++) _smsBuffer[i] = _smsBuffer[i + 1];
-            e = &_smsBuffer[MAX_SMS - 1];
+        if (strcmp(lineBuf, "OK") == 0) { gotTerminator = true; break; }
+        if (strcmp(lineBuf, "ERROR") == 0
+            || strncmp(lineBuf, "+CMS ERROR", 10) == 0
+            || strncmp(lineBuf, "+CME ERROR", 10) == 0) {
+            LOG("[SMS] Modem returned %s\n", lineBuf);
+            sawError = true;
+            break;
         }
+        if (strncmp(lineBuf, "+CMGL:", 6) != 0) continue;  // skip URCs / blank lines
 
+        // ── Parse SIM index ─────────────────────────────────────────────
+        // SIM800 SMS storage indexes are small positive integers; treat
+        // anything else as a malformed header and skip it.
+        int simIdx = atoi(lineBuf + 7);
+        if (simIdx <= 0 || simIdx > 1000) continue;
+
+        // ── Allocate slot in the working buffer ────────────────────────
+        SmsEntry* e;
+        bool overflow = (newSmsCount >= MAX_SMS);
+        if (!overflow) {
+            e = &workBuffer[newSmsCount];
+        } else {
+            if (deleteCount < 20) toDelete[deleteCount++] = workBuffer[0].index;
+            if (workBuffer[0].unread && newUnreadCount > 0) newUnreadCount--;
+            for (int i = 0; i < MAX_SMS - 1; i++) workBuffer[i] = workBuffer[i + 1];
+            e = &workBuffer[MAX_SMS - 1];
+        }
         memset(e, 0, sizeof(SmsEntry));
         e->index = simIdx;
 
-        // ── Read/Unread ──────────────────────────────────────────────────────
+        // ── Read/Unread, restoring locally tracked state ────────────────
         e->unread = (strstr(lineBuf, "\"REC UNREAD\"") != NULL);
-
-        // Restore locally-tracked state (prevents flicker when modem marks as read)
-        for (int i = 0; i < oldSmsCount; i++) {
-            if (oldBuffer[i].index == simIdx) {
-                e->unread = oldBuffer[i].unread;
+        for (int i = 0; i < _smsCount; i++) {
+            if (_smsBuffer[i].index == simIdx) {
+                e->unread = _smsBuffer[i].unread;
                 break;
             }
         }
-        if (e->unread) _unreadSmsCount++;
 
-        // ── Sender (2nd quoted token: <oa>/<da>) ──────────────────────────────
-        // +CMGL: <idx>,"<stat>","<oa>",[<alpha>],"<scts>" — when <alpha> is
-        // empty (no SIM phonebook match) the 3rd quoted token is the
-        // timestamp, not the sender.
+        // ── Sender (2nd quoted token: <oa>/<da>) ──────────────────────────
+        // +CMGL: <idx>,"<stat>","<oa>",[<alpha>],"<scts>" — when <alpha>
+        // is empty the 3rd token is the timestamp, not the sender.
         extractQuoted(lineBuf, 2, e->sender, sizeof(e->sender));
-
-        // ── Timestamp (last quoted token) ─────────────────────────────────────
         extractLastQuoted(lineBuf, e->timestamp, sizeof(e->timestamp));
 
-        // ── Body (next line) ──────────────────────────────────────────────────
-        unsigned long bodyTimeout = millis() + 1000;
+        // ── Body (next non-empty line) ─────────────────────────────────
+        unsigned long bodyDeadline = millis() + 1500;
         bool gotBody = false;
-        while (millis() < bodyTimeout && !gotBody) {
+        while ((long)(millis() - bodyDeadline) < 0
+               && (long)(millis() - deadline) < 0) {
             vTaskDelay(pdMS_TO_TICKS(1));
             if (!modem.stream.available()) continue;
 
             size_t bLen = modem.stream.readBytesUntil('\n', bodyBuf, sizeof(bodyBuf) - 1);
             bodyBuf[bLen] = '\0';
             trimBuf(bodyBuf);
-            gotBody = true;
+            if (bodyBuf[0] == '\0') continue;  // blank separator
 
             size_t bodyLen = strlen(bodyBuf);
             if (looksLikeUcs2(bodyBuf, bodyLen)) {
@@ -195,16 +224,49 @@ void SmsManager::pollSms() {
                 strncpy(e->body, bodyBuf, sizeof(e->body) - 1);
                 e->body[sizeof(e->body) - 1] = '\0';
             }
+            gotBody = true;
+            break;
         }
+
+        if (!gotBody) {
+            // Drop the half-parsed slot; the next poll will pick the SMS
+            // up again. We do NOT abort the whole poll here — one stuck
+            // record shouldn't cost us the rest of the listing.
+            LOG("[SMS] Body timeout for idx %d, dropping\n", simIdx);
+            memset(e, 0, sizeof(SmsEntry));
+            if (overflow) {
+                // We already shifted the array down. Keep newSmsCount as
+                // is so the cleared trailing slot is reused next round.
+            }
+            continue;
+        }
+
+        if (!overflow) newSmsCount++;
+        if (e->unread) newUnreadCount++;
     }
 
+    drainStream(modem, 100);
     modem.stream.setTimeout(prevTimeout);
 
-    // Delete overflow messages from the SIM card
+    if (sawError || !gotTerminator) {
+        LOG("[SMS] Poll did not complete (term=%d err=%d any=%d) — keeping cached list\n",
+            (int)gotTerminator, (int)sawError, (int)sawAnyByte);
+        return false;
+    }
+
+    // ── Commit ──────────────────────────────────────────────────────────
+    memcpy(_smsBuffer, workBuffer, sizeof(_smsBuffer));
+    _smsCount       = newSmsCount;
+    _unreadSmsCount = newUnreadCount;
+
+    // Best-effort delete of overflow messages on the SIM. Failures here
+    // are non-fatal — the next poll will try again.
     for (int i = 0; i < deleteCount; i++) {
         modem.sendAT(GF("+CMGD="), toDelete[i]);
         modem.waitResponse(500);
     }
+
+    return true;
 }
 
 void SmsManager::fillState(DeviceState& state) {
