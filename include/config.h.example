@@ -29,7 +29,7 @@
 #define WIFI_PASS     "YourWiFiPassword"
 
 // — Cloudflare Proxy —
-// The firmware posts to this host/path over raw TCP (port 80).
+// The firmware posts JSON to this host/path over raw TCP (port 80).
 // Set up a Cloudflare Worker or similar HTTPS proxy to forward to Supabase.
 #define PROXY_HOST      "api.yourdomain.com"
 #define PROXY_PATH      "/uplink"
@@ -43,79 +43,28 @@
 
 // — Device Identity —
 #define DEVICE_ID     "GPS-001"    // Unique ID sent with every packet
-#define FW_VERSION    "1.1.0"      // Must match GitHub Release tag (without 'v')
-
-// ============================================================
-//  PAYLOAD PROFILE
-// ============================================================
-// Two wire formats are supported so both can be A/B tested in the field.
-// The Cloudflare Worker must be updated to recognise whichever profile is active.
-//
-//   COMPACT  → binary frame, ~20 B/packet, Content-Type: application/octet-stream
-//   FULL     → short-key JSON, ~80 B/packet, Content-Type: application/json
-//
-// On a SIM800/2G link a 5-packet COMPACT batch is ~110 B; a 5-packet FULL batch
-// is ~430 B. COMPACT comfortably sustains 1 update/sec; FULL trades some headroom
-// for human-readable wire format.
-#define PAYLOAD_PROFILE_COMPACT  1
-#define PAYLOAD_PROFILE_FULL     2
-#define PAYLOAD_PROFILE          PAYLOAD_PROFILE_COMPACT
+#define FW_VERSION    "1.0.0"      // Must match GitHub Release tag (without 'v')
 
 // — Timing (ms) —
 #define GPS_READ_INTERVAL       400
-#define BUFFER_INTERVAL_MOVING  1000      // 1 Hz packet rate when moving
-#define BUFFER_INTERVAL_IDLE    15000     // 15 s when stationary (battery save)
+#define BUFFER_INTERVAL_MOVING  10000     // 10s when moving
+#define BUFFER_INTERVAL_IDLE    10000     // 10s when stationary
 #define SPEED_THRESHOLD_KMH     2.0       // moving vs stationary threshold
 #define DISPLAY_REFRESH         100       // 10 Hz UI refresh
 #define OTA_CHECK_INTERVAL      21600000  // 6 hours
-
-// Adaptive batching: the uplink task sends as soon as either the batch fills
-// or the interval elapses, whichever comes first. Keep MOVING small so motion
-// reaches the server within a few seconds; let IDLE accumulate to amortise
-// the per-uplink TCP cost.
-#define UPLINK_BATCH_SIZE_MOVING   5      // 5 s of motion per uplink
-#define UPLINK_BATCH_SIZE_IDLE     10     // amortise TCP cost when idle
-// "Max latency" before flushing whatever is buffered. The uplink fires when
-// either the batch fills OR this interval elapses, whichever comes first.
-#define UPLINK_INTERVAL_MOVING     5000   // 5 s — flush even if batch isn't full
-#define UPLINK_INTERVAL_IDLE       30000  // 30 s between idle uplinks
-
-// HTTP/1.1 keep-alive: keep the TCP socket open across uplinks. Saves the
-// ~5–10 s TCP handshake + GPRS PDP roundtrip on every cycle. The socket is
-// recycled either when the server closes it or after this max age.
-#define UPLINK_KEEPALIVE_MAX_AGE_MS  60000  // 60 s
-#define BUTTON_DEBOUNCE              50
+#define UPLINK_BATCH_SIZE_MOVING  1       // packets per uplink cycle when moving
+#define UPLINK_BATCH_SIZE_IDLE    1       // packets per uplink cycle when idle
+#define UPLINK_INTERVAL_MOVING    0       // ms — TCP latency provides natural pacing
+#define UPLINK_INTERVAL_IDLE      10000   // ms — 10s between uplink cycles when stationary
+#define BUTTON_DEBOUNCE         50
 
 // — Tracking Schedule (defaults, overridden by dashboard) —
 #define SCHEDULE_ENABLED  false
 
 // — GPS UART —
-// Set GPS_BAUD_TARGET above 9600 to unlock the 5 Hz output path in
-// gps_manager.cpp. 38400 is a reliable middle ground on the NEO-6M; only
-// drop back to 9600 if you see corrupted NMEA on serial.
 #define GPS_BAUD_DEFAULT  9600
-#define GPS_BAUD_TARGET   38400
+#define GPS_BAUD_TARGET   9600    // Stay at 9600 to prevent parse failures
 #define GPS_UPDATE_RATE   5       // Hz
-
-// ============================================================
-//  AGPS / AssistNow
-// ============================================================
-// Drops cold-start TTFF from ~45–60 s to ~5 s by injecting time, approximate
-// position, and ephemerides into the NEO-6M before it starts searching.
-//
-// On every boot the firmware does:
-//   1. UBX-AID-INI: UTC from the GSM network + last-known lat/lon from NVS
-//   2. AssistNow Online: HTTP GET via the Cloudflare Worker, stream UBX-MGA-*
-//      bytes straight to the GPS UART
-//
-// Set ASSISTNOW_PATH to a Worker route that fetches
-//   https://online-live1.services.u-blox.com/GetOnlineData.ashx
-//     ?token=<token>;gnss=gps;datatype=eph,alm,aux,pos;
-// and returns the binary body unmodified to the device. The token stays
-// server-side so it never lives on flash.
-#define ASSISTNOW_ENABLE   1
-#define ASSISTNOW_PATH     "/agps"        // Worker route relative to PROXY_HOST
-#define ASSISTNOW_MAX_LEN  4096           // hard cap on injected bytes
 
 // — Display —
 #define OLED_WIDTH   128
