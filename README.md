@@ -83,7 +83,7 @@ GPIO  1       ──► Button B (BACK / HANG)
 ## Features
 
 - **Real-time GPS** at up to 5 Hz with TinyGPSPlus (latitude, longitude, altitude, speed, course, HDOP, satellites)
-- **AssistNow / AGPS** - cold-start TTFF dropped from ~45–60 s to ~1–5 s by injecting last-known position (NVS) and live u-blox MGA data via the Cloudflare Worker on every boot
+- **AGPS position seed** - cold-start TTFF dropped from ~45–60 s to ~30 s by persisting every good fix to NVS and replaying it via UBX-AID-INI on the next boot. No external service, no token, no cost — works because the NEO-6M doesn't need to download an almanac when it knows roughly where it is.
 - **GSM/GPRS data uplink** to a Cloudflare-proxied REST API backed by Supabase, using a persistent HTTP/1.1 keep-alive socket so each batch skips the 2G TCP handshake
 - **Two wire formats** - compact binary (~20 B/packet) or short-key JSON (~80 B/packet), selectable from `config.h` so the same firmware can A/B test both on the same Worker
 - **Speed-adaptive buffering** - 1 Hz packets when moving, 15 s when stationary
@@ -350,19 +350,22 @@ A 5-packet batch is ~110 B (binary) vs ~430 B (short-key JSON) vs ~1500 B (the o
 
 The firmware opens **one** TCP socket to the Worker and reuses it for up to `UPLINK_KEEPALIVE_MAX_AGE_MS` (default 60 s). Headers send `Connection: keep-alive`. This skips the ~5–10 s 2G TCP handshake on every uplink after the first, which is the dominant latency on SIM800 GPRS.
 
-#### AssistNow / AGPS Setup
+#### AGPS Position Seeding
 
-The NEO-6M cold-starts in 45–60 s without assistance. The firmware uses two helpers to drop this to ~1–5 s:
+The NEO-6M cold-starts in 45–60 s without any assistance. To improve this for free, the firmware persists every good fix to NVS once a minute and replays it via UBX-AID-INI on the next boot. Knowing roughly where it is, the receiver can skip the slow almanac search and reach a fix in ~30 s instead.
 
-1. **UBX-AID-INI position seed** — the last valid fix is persisted to NVS once a minute. On boot, that lat/lon is injected into the receiver before satellite search begins.
-2. **AssistNow Online** — on each boot, after GPRS comes up, the firmware does `GET <PROXY_HOST><ASSISTNOW_PATH>` and streams the binary response directly to the GPS UART.
+This is fully on-device — no Worker call, no token, no service account.
 
-The Worker route at `ASSISTNOW_PATH` (default `/agps`) is expected to:
-- Sign in to your u-blox AssistNow account (free tier available at [thingstream.io](https://www.thingstream.io/))
-- Fetch `https://online-live1.services.u-blox.com/GetOnlineData.ashx?token=<YOUR_TOKEN>;gnss=gps;datatype=eph,alm,aux,pos;`
-- Return the binary body unmodified to the device
+##### A note on u-blox AssistNow Online
 
-The token stays server-side so it never lives in firmware. Set `ASSISTNOW_ENABLE 0` in `config.h` to disable the fetch (the AID-INI position seed still runs).
+The original v1.1 plan was also to fetch live ephemerides from u-blox's AssistNow Online service over GPRS for a 5 s TTFF. That plan is no longer viable:
+
+- u-blox stopped issuing AssistNow Online tokens on **3 June 2025**.
+- End of Maintenance and End of Support are **31 May 2026**.
+- The free replacement (AssistNow Predictive Orbits) only supports Gen9/Gen10 receivers — the NEO-6M is Gen6 and not eligible.
+- There is no paid alternative for the NEO-6M either.
+
+`ASSISTNOW_ENABLE` therefore defaults to `0` in `config.h.example`. The `/agps` route in the Cloudflare Worker is left in place for future use (it returns 503 if no token is configured) but the device won't call it.
 
 ### OTA Updates (GitHub + Supabase)
 
