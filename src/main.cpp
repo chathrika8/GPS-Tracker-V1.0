@@ -116,7 +116,7 @@ void setup() {
     // ── Create FreeRTOS tasks ──
     xTaskCreate(gpsTask,      "GPS",      4096, NULL, 3, &gpsTaskHandle);
     xTaskCreate(bufferTask,   "Buffer",   4096, NULL, 2, &bufferTaskHandle);
-    xTaskCreate(uplinkTask,   "Uplink",   16384, NULL, 2, &uplinkTaskHandle);
+    xTaskCreate(uplinkTask,   "Uplink",   24576, NULL, 2, &uplinkTaskHandle);
     xTaskCreate(displayTask,  "Display",  4096, NULL, 1, &displayTaskHandle);
     xTaskCreate(buttonTask,   "Button",   2048, NULL, 1, &buttonTaskHandle);
     xTaskCreate(scheduleTask, "Schedule", 2048, NULL, 1, &scheduleTaskHandle);
@@ -299,13 +299,21 @@ void uplinkTask(void* param) {
             lastCellSave = millis();
         }
         
+        // Query OUTSIDE mutex
+        String operatorName;
+        int signalPct = 0;
+        if (connected) {
+            signalPct = gsmManager.getSignalPercent();
+            operatorName = gsmManager.getOperator();
+        }
+
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             deviceState.gprs_connected = connected;
             deviceState.registered_2g = registered;
             
             if (connected) {
-                deviceState.signal_percent = gsmManager.getSignalPercent();
-                strncpy(deviceState.network_name, gsmManager.getOperator().c_str(), sizeof(deviceState.network_name));
+                deviceState.signal_percent = signalPct;
+                strncpy(deviceState.network_name, operatorName.c_str(), sizeof(deviceState.network_name));
             }
             xSemaphoreGive(stateMutex);
         }
@@ -315,6 +323,7 @@ void uplinkTask(void* param) {
         static uint32_t lastBattCheck = 0;
         if (millis() - lastBattCheck > 60000 || lastBattCheck == 0) {
             int pct = -1;
+            serverComm.closeSocket(); // ensure no TCP state before AT+CBC
             float v = powerManager.readBatteryVoltage(&pct);
             if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 deviceState.battery_voltage = v;

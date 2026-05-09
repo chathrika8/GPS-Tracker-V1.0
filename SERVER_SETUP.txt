@@ -77,8 +77,10 @@ const SUPABASE_URL = 'https://wwsiimmmkrhieumkrkhq.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind3c2lpbW1ta3JoaWV1bWtya2hxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQyMzg2NTcsImV4cCI6MjA4OTgxNDY1N30.9sPJnJZnWssEwX9TJUQ_p6Pi3MJk_RuP-lgO9NPk1kY';
 
 // Optional: device_id hash → friendly name. Leave {} to fall back to hex.
+// Hash is computed as FNV-1a of the ASCII device ID string.
+// e.g. printf "GPS-001" | python3 -c '...' → 0xe2875a91
 const DEVICE_MAP = {
-  // '0xc0ffee01': 'GPS-001',
+  '0xe2875a91': 'GPS-001',   // FNV-1a("GPS-001")
 };
 
 // Used as the fw_version on rows decoded from the binary frame, which
@@ -303,3 +305,99 @@ If anything goes wrong, the previous Worker version is one click away
 in Workers → your Worker → Deployments. The firmware on the device
 retries on the next cycle, so no data is permanently lost beyond the
 in-flight batch.
+
+-----------------------------------------------------------------
+  SUPABASE — COMMANDS TABLE (required for remote control)
+-----------------------------------------------------------------
+
+Run the following SQL in Supabase → SQL Editor to create the commands
+table that the firmware's command poller reads from.  The locations
+table already exists; only this new table needs to be created.
+
+-- ── commands table ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS public.commands (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    device_id  TEXT        NOT NULL,
+    command    TEXT        NOT NULL,
+    params     TEXT        NOT NULL DEFAULT '',
+    status     TEXT        NOT NULL DEFAULT 'pending'
+                           CHECK (status IN ('pending', 'executed', 'failed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Index so the device poll (device_id=eq.X&status=eq.pending) is fast
+CREATE INDEX IF NOT EXISTS commands_device_status_idx
+    ON public.commands (device_id, status);
+
+-- Auto-update updated_at on any row change
+CREATE OR REPLACE FUNCTION public.set_updated_at()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN NEW.updated_at = now(); RETURN NEW; END; $$;
+
+CREATE TRIGGER commands_updated_at
+    BEFORE UPDATE ON public.commands
+    FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+-- RLS: enable so the anon key can only read/update its own device rows
+ALTER TABLE public.commands ENABLE ROW LEVEL SECURITY;
+
+-- Allow the device (anon key) to SELECT pending commands for any device_id
+CREATE POLICY "device_read_commands" ON public.commands
+    FOR SELECT USING (true);
+
+-- Allow the device (anon key) to PATCH status to 'executed'
+-- (the firmware ACK uses PATCH /rest/v1/commands?id=eq.<uuid>)
+CREATE POLICY "device_ack_commands" ON public.commands
+    FOR UPDATE USING (true)
+    WITH CHECK (status IN ('executed', 'failed'));
+-- ──────────────────────────────────────────────────────────────
+
+To send a command from the dashboard (or curl):
+    INSERT INTO commands (device_id, command, params)
+    VALUES ('GPS-001', 'reboot', '');
+
+    -- With params (e.g. schedule):
+    INSERT INTO commands (device_id, command, params)
+    VALUES ('GPS-001', 'set_schedule',
+            '{"start":"08:00","stop":"18:00","tz":"Asia/Colombo"}');
+
+-----------------------------------------------------------------
+  FIRMWARE BUG FIXES (command_handler.cpp — applied 2026-05-09)
+-----------------------------------------------------------------
+
+Three bugs were found and fixed in src/command_handler.cpp:
+
+  BUG 1 — JSON parsing: doc["commands"] key does not exist
+  ─────────────────────────────────────────────────────────
+  Supabase REST API returns a plain JSON array:
+      [ {"id": "...", "command": "reboot", ...}, ... ]
+
+  The old code iterated doc["commands"].as<JsonArray>() which always
+  yields an empty array because the root IS the array, not an object
+  with a "commands" key.  Nothing was ever executed silently.
+
+  Fix: iterate doc.as<JsonArray>() directly.
+
+  BUG 2 — ACK endpoint: POST /rest/v1/command_acks (table does not exist)
+  ────────────────────────────────────────────────────────────────────────
+  The old code POSTed to /rest/v1/command_acks — a table that was never
+  created.  Supabase returns 404 on every ACK, so every command gets
+  re-delivered on the next poll cycle (infinite loop for reboot!).
+
+  Fix: use PATCH /rest/v1/commands?id=eq.<uuid> with body
+       {"status":"executed"} — the standard PostgREST update pattern.
+
+  BUG 3 — Socket race: commandHandler steals serverComm's keep-alive socket
+  ──────────────────────────────────────────────────────────────────────────
+  serverComm.postBytes() keeps the TinyGsmClient socket open between
+  uplinks (Connection: keep-alive, UPLINK_KEEPALIVE_MAX_AGE_MS = 60 s).
+  commandHandler.httpGet() and the old inline ACK code called
+  gsmManager.getClient() and then client.connect() on the SAME object
+  while serverComm thought it still owned it.  This corrupts the modem's
+  single TCP channel and causes silent data loss or a modem hang.
+
+  Fix: call serverComm.closeSocket() before commandHandler opens any
+  TCP connection.  serverComm will re-open a fresh keep-alive socket
+  on the next sendBatch() call automatically.
+
