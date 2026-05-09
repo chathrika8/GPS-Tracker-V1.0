@@ -1,4 +1,5 @@
 #include "ota_manager.h"
+#include "log.h"
 #include "gsm_manager.h"
 #include "wifi_manager.h"
 #include "config.h"
@@ -8,23 +9,23 @@
 OTAManager otaManager;
 
 void OTAManager::begin() {
-    Serial.println("[OTA] Ready.");
+    LOG("[OTA] Ready.");
 }
 
 void OTAManager::checkAndUpdate() {
-    Serial.println("[OTA] Checking for updates...");
+    LOG("[OTA] Checking for updates...");
 
     if (checkGitHub()) return;    // GitHub is primary
     if (checkSupabase()) return;  // Supabase manifest is the fallback
 
-    Serial.println("[OTA] Firmware is up to date.");
+    LOG("[OTA] Firmware is up to date.");
 }
 
 bool OTAManager::checkGitHub() {
     TinyGsmClient& client = gsmManager.getClient();
 
     if (!client.connect("api.github.com", 443)) {
-        Serial.println("[OTA] Cannot reach api.github.com");
+        LOG("[OTA] Cannot reach api.github.com");
         return false;
     }
 
@@ -57,7 +58,7 @@ bool OTAManager::checkGitHub() {
 
     JsonDocument doc;
     if (deserializeJson(doc, body) != DeserializationError::Ok) {
-        Serial.println("[OTA] Failed to parse GitHub response");
+        LOG("[OTA] Failed to parse GitHub response");
         return false;
     }
 
@@ -68,7 +69,7 @@ bool OTAManager::checkGitHub() {
     const char* version = (tagName[0] == 'v' || tagName[0] == 'V') ? tagName + 1 : tagName;
 
     if (strcmp(version, FW_VERSION) <= 0) {
-        Serial.printf("[OTA] GitHub: %s — no update needed\n", version);
+        LOG("[OTA] GitHub: %s — no update needed\n", version);
         return false;
     }
 
@@ -85,11 +86,11 @@ bool OTAManager::checkGitHub() {
     }
 
     if (firmwareUrl.isEmpty()) {
-        Serial.println("[OTA] No firmware.bin in release assets");
+        LOG("[OTA] No firmware.bin in release assets");
         return false;
     }
 
-    Serial.printf("[OTA] Downloading v%s...\n", version);
+    LOG("[OTA] Downloading v%s...\n", version);
     return downloadAndFlash(firmwareUrl.c_str(), 0, "");
 }
 
@@ -152,7 +153,7 @@ bool OTAManager::downloadAndFlash(const char* url, size_t expectedSize, const ch
     //
     // Blocked on: HTTP redirect handling over TinyGSM raw TCP.
 
-    Serial.printf("[OTA] Download pending — URL: %s\n", url);
+    LOG("[OTA] Download pending — URL: %s\n", url);
     return false;
 }
 

@@ -22,6 +22,13 @@ public:
     // Used to seed UBX-AID-INI before GPS cold-start.
     uint32_t getNetworkUtcEpoch();
 
+    // Cell-tower geolocation via AT+CIPGSMLOC=1,1. The SIM800 firmware
+    // queries Google's cell-tower DB on its own — we don't need any token
+    // or Worker route. Accuracy is ~1–5 km, plenty for an AID-INI seed
+    // when NVS doesn't have a saved last position (e.g. first boot ever).
+    // Returns true on success and writes lat/lon (degrees) into *lat/*lon.
+    bool getCellLocation(double* lat, double* lon);
+
     // HTTP methods via TinyGSM
     TinyGsmClient& getClient();
     TinyGsm&       getModem();

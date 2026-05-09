@@ -12,6 +12,7 @@
  */
 
 #include <Arduino.h>
+#include "log.h"
 #include <Wire.h>
 #include <nvs_flash.h>
 #include "config.h"
@@ -27,15 +28,34 @@
 #include "button_handler.h"
 #include "power_manager.h"
 
-// ── Fallback defaults for v1.1.0 macros ──
+// ── Fallback defaults for v1.1 macros ──
 // Override in include/config.h to tune; these just keep the build green
 // against older config.h files that pre-date the AGPS additions.
-#ifndef ASSISTNOW_ENABLE
-#define ASSISTNOW_ENABLE   1
+#ifndef GPS_NVS_SAVE_INTERVAL_MS
+#define GPS_NVS_SAVE_INTERVAL_MS   30000
 #endif
-#ifndef ASSISTNOW_MAX_LEN
-#define ASSISTNOW_MAX_LEN  4096
+#ifndef CELL_NVS_SAVE_INTERVAL_MS
+#define CELL_NVS_SAVE_INTERVAL_MS  300000
 #endif
+#ifndef EPH_POLL_INTERVAL_MS
+#define EPH_POLL_INTERVAL_MS       1800000
+#endif
+#ifndef EPH_MAX_AGE_SEC
+#define EPH_MAX_AGE_SEC            10800
+#endif
+#ifndef AGPS_RESEED_KM
+#define AGPS_RESEED_KM             50
+#endif
+
+// Approximate great-circle distance in km using the equirectangular
+// projection. Plenty accurate for the "did the device move?" check.
+static double approxKm(double lat1, double lon1, double lat2, double lon2) {
+    const double DEG = 0.017453292519943295;        // π / 180
+    double avg = ((lat1 + lat2) * 0.5) * DEG;
+    double dx  = (lon2 - lon1) * DEG * cos(avg);
+    double dy  = (lat2 - lat1) * DEG;
+    return 6371.0 * sqrt(dx * dx + dy * dy);
+}
 
 // ── Shared device state (mutex-protected) ──
 DeviceState deviceState;
@@ -58,8 +78,10 @@ void buttonTask(void* param);
 void scheduleTask(void* param);
 
 void setup() {
-    Serial.begin(115200);
-    Serial.println("\n[GPS-TRACKER] Booting " FW_VERSION "...");
+    // Deliberately no Serial.begin(115200) — UART0's default pins (GPIO 20/21)
+    // are wired to the SIM800L on this board, and any byte sent there before
+    // gpsManager remaps Serial to GPS_RX/GPS_TX would jam the modem's AT line.
+    LOG("\n[GPS-TRACKER] Booting " FW_VERSION "...");
 
     // Initialize I2C and Display FIRST so we don't have a black screen
     Wire.begin(I2C_SDA, I2C_SCL);
@@ -89,7 +111,7 @@ void setup() {
     otaManager.begin();
 
     // GSM init shifted to uplinkTask to prevent blocking the UI
-    Serial.println("[GPS-TRACKER] Modules initialized. Starting tasks...");
+    LOG("[GPS-TRACKER] Modules initialized. Starting tasks...");
 
     // ── Create FreeRTOS tasks ──
     xTaskCreate(gpsTask,      "GPS",      4096, NULL, 3, &gpsTaskHandle);
@@ -99,7 +121,7 @@ void setup() {
     xTaskCreate(buttonTask,   "Button",   2048, NULL, 1, &buttonTaskHandle);
     xTaskCreate(scheduleTask, "Schedule", 2048, NULL, 1, &scheduleTaskHandle);
 
-    Serial.println("[GPS-TRACKER] All tasks started.");
+    LOG("[GPS-TRACKER] All tasks started.");
 }
 
 void loop() {
@@ -126,20 +148,18 @@ void gpsTask(void* param) {
 }
 
 // ─────────────────────────────────────────────
-// Buffer Task — Save GPS packets to SPIFFS
+// Buffer Task — Save GPS packets to LittleFS + maintain AGPS NVS cache
 // ─────────────────────────────────────────────
 void bufferTask(void* param) {
-    // Persist the most recent fix to NVS once a minute so the next boot can
-    // seed UBX-AID-INI with a coarse position. Cheap insurance against the
-    // NEO-6M's lack of a backup battery on most cheap dev boards.
-    static uint32_t lastNvsWrite = 0;
+    // GPS fix → NVS at GPS_NVS_SAVE_INTERVAL_MS so the next boot has a
+    // recent coarse seed. Independent of the LittleFS upload buffer cadence.
+    static uint32_t lastGpsNvsWrite = 0;
 
     for (;;) {
         bool moving = false;
 
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             double spd = deviceState.speed_kmh;
-            // Use SPEED_THRESHOLD for selecting buffer interval (fast vs slow).
             moving = spd > SPEED_THRESHOLD_KMH;
 
             if (deviceState.gps_fix) {
@@ -148,23 +168,21 @@ void bufferTask(void* param) {
                 pkt.latitude   = deviceState.latitude;
                 pkt.longitude  = deviceState.longitude;
                 pkt.altitude_m = deviceState.altitude_m;
-                // Clamp to 0 below noise floor — matches display behaviour
                 pkt.speed_kmh  = (deviceState.speed_kmh < 1.5f) ? 0.0f : deviceState.speed_kmh;
                 pkt.course     = deviceState.course;
                 pkt.satellites = deviceState.satellites;
                 pkt.hdop       = deviceState.hdop;
                 pkt.gsm_signal = deviceState.signal_percent;
                 pkt.battery_v  = deviceState.battery_voltage;
-
                 packetBuffer.store(pkt);
 
-                if (millis() - lastNvsWrite > 60000UL) {
+                if (millis() - lastGpsNvsWrite > GPS_NVS_SAVE_INTERVAL_MS) {
                     gpsManager.saveLastPositionToNVS(
                         deviceState.latitude,
                         deviceState.longitude,
                         (float)deviceState.altitude_m,
                         deviceState.utc_epoch);
-                    lastNvsWrite = millis();
+                    lastGpsNvsWrite = millis();
                 }
             }
             xSemaphoreGive(stateMutex);
@@ -179,7 +197,7 @@ void bufferTask(void* param) {
 // Uplink Task — Drain buffer via GPRS
 // ─────────────────────────────────────────────
 void uplinkTask(void* param) {
-    Serial.println("[UPLINK] Initializing GSM asynchronously...");
+    LOG("[UPLINK] Initializing GSM asynchronously...");
     gsmManager.begin();
 
     if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
@@ -187,43 +205,98 @@ void uplinkTask(void* param) {
         xSemaphoreGive(stateMutex);
     }
 
-    bool agpsDone   = false;   // AssistNow / AID-INI runs once per boot
-    uint32_t lastSendMs = 0;
+    // ── Phase 1: Boot-time AGPS — runs IMMEDIATELY using NVS only.
+    //    Don't wait for GSM. The faster the receiver gets a coarse seed, the
+    //    sooner it acquires its first fix. NVS has whatever was saved before
+    //    last shutdown (could be sub-km if the device hasn't moved since).
+    {
+        double nvsLat = 0, nvsLon = 0, cellLat = 0, cellLon = 0;
+        float  nvsAlt = 0;
+        uint32_t nvsTs = 0, cellTs = 0;
+        bool haveNvs  = gpsManager.loadLastPositionFromNVS(&nvsLat, &nvsLon, &nvsAlt, &nvsTs);
+        bool haveCell = gpsManager.loadCellPositionFromNVS(&cellLat, &cellLon, &cellTs);
+
+        // If both saved, prefer the more recent — same-trip GPS is more
+        // accurate, but if cell was saved later (last thing before shutdown
+        // in poor sky) it's the better hint.
+        const char* src = "NONE ";
+        double seedLat = 0, seedLon = 0;
+        float  seedAlt = 0;
+        if (haveNvs && (!haveCell || nvsTs >= cellTs)) {
+            seedLat = nvsLat; seedLon = nvsLon; seedAlt = nvsAlt; src = "NVS  ";
+        } else if (haveCell) {
+            seedLat = cellLat; seedLon = cellLon; seedAlt = 0; src = "CELL ";
+        }
+
+        if (src[0] != 'N') {
+            gpsManager.injectAidIni(0, seedLat, seedLon, seedAlt);
+        }
+
+        int replayed = gpsManager.replayEphemeridesFromNVS(0, EPH_MAX_AGE_SEC);
+
+        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            strncpy(deviceState.agps_source, src, sizeof(deviceState.agps_source));
+            deviceState.agps_eph_count = (uint8_t)replayed;
+            deviceState.agps_reseeded  = false;
+            xSemaphoreGive(stateMutex);
+        }
+    }
+
+    bool     agpsReseedTried = false;
+    uint32_t lastCellSave    = 0;
+    uint32_t lastSendMs      = 0;
 
     for (;;) {
-        bool connected = gsmManager.isGprsConnected();
+        bool connected  = gsmManager.isGprsConnected();
         bool registered = gsmManager.isRegistered();
 
-        // ── AGPS bring-up: run once when GPRS first comes up ──
-        if (connected && !agpsDone) {
-            // Seed receiver with last-known position from NVS
-            double lastLat = 0, lastLon = 0;
-            float  lastAlt = 0;
-            uint32_t lastTs = 0;
-            if (gpsManager.loadLastPositionFromNVS(&lastLat, &lastLon, &lastAlt, &lastTs)) {
-                Serial.printf("[AGPS] Seeding AID-INI with %.5f,%.5f\n", lastLat, lastLon);
+        // ── Phase 2: GSM-up re-seed.
+        //    Once GPRS is up, fetch a fresh cell-tower position. If the GPS
+        //    still hasn't fixed AND the cell location disagrees with what we
+        //    already seeded by more than AGPS_RESEED_KM, the device must have
+        //    moved while powered off. Push a fresh AID-INI so the receiver
+        //    stops searching for satellites that aren't visible.
+        if (connected && !agpsReseedTried) {
+            double cLat, cLon;
+            if (gsmManager.getCellLocation(&cLat, &cLon)) {
                 uint32_t utc = gsmManager.getNetworkUtcEpoch();
-                gpsManager.injectAidIni(utc, lastLat, lastLon, lastAlt);
-            }
+                gpsManager.saveCellPositionToNVS(cLat, cLon, utc ? utc : (millis() / 1000));
+                lastCellSave = millis();
 
-#if ASSISTNOW_ENABLE
-            // Pull AssistNow Online via the Worker; stream straight to GPS UART.
-            static uint8_t agpsBuf[ASSISTNOW_MAX_LEN];
-            size_t agpsLen = 0;
-            if (serverComm.fetchAssistNow(agpsBuf, sizeof(agpsBuf), &agpsLen) && agpsLen > 0) {
-                Serial.printf("[AGPS] Injecting %u bytes from AssistNow\n",
-                              (unsigned)agpsLen);
-                gpsManager.injectAssistNowBlob(agpsBuf, agpsLen);
-                if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    deviceState.agps_injected = true;
-                    deviceState.agps_bytes    = (uint16_t)agpsLen;
+                bool fixYet = false;
+                double curLat = 0, curLon = 0;
+                float  curAlt = 0;
+                uint32_t curTs = 0;
+                if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    fixYet = deviceState.gps_fix;
                     xSemaphoreGive(stateMutex);
                 }
-            } else {
-                Serial.println("[AGPS] AssistNow fetch failed — relying on AID-INI seed only");
+                bool haveSeed = gpsManager.loadLastPositionFromNVS(&curLat, &curLon, &curAlt, &curTs);
+                bool moved = haveSeed && approxKm(curLat, curLon, cLat, cLon) > AGPS_RESEED_KM;
+
+                if (!fixYet && (moved || !haveSeed)) {
+                    // Device was carried elsewhere, or has no NVS history at all.
+                    gpsManager.injectAidIni(utc, cLat, cLon, 0.0f);
+                    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        strncpy(deviceState.agps_source, "RESEED", sizeof(deviceState.agps_source));
+                        deviceState.agps_reseeded = true;
+                        xSemaphoreGive(stateMutex);
+                    }
+                }
             }
-#endif
-            agpsDone = true;
+            agpsReseedTried = true;
+        }
+
+        // ── Phase 3: periodic cell-tower freshness anchor.
+        //    Saves the latest cell fix to NVS so the next cold boot has a
+        //    second source of truth alongside the GPS NVS save.
+        if (connected && (millis() - lastCellSave) > CELL_NVS_SAVE_INTERVAL_MS) {
+            double cLat, cLon;
+            if (gsmManager.getCellLocation(&cLat, &cLon)) {
+                uint32_t utc = gsmManager.getNetworkUtcEpoch();
+                gpsManager.saveCellPositionToNVS(cLat, cLon, utc ? utc : (millis() / 1000));
+            }
+            lastCellSave = millis();
         }
         
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -296,6 +369,28 @@ void uplinkTask(void* param) {
                 if (sent > 0) {
                     // After successful send, poll for commands
                     commandHandler.pollAndExecute();
+
+                    // ── Refresh local ephemeris cache (rate-limited) ──
+                    // Gated on a strong fix (≥ 6 sats) to avoid wasting flash
+                    // writes on partial constellations.
+                    static uint32_t lastEphPoll = 0;
+                    bool   fixGood = false;
+                    uint32_t nowEpoch = 0;
+                    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        fixGood  = deviceState.gps_fix && deviceState.satellites >= 6;
+                        nowEpoch = deviceState.utc_epoch;
+                        xSemaphoreGive(stateMutex);
+                    }
+                    bool due = (lastEphPoll == 0)
+                            || (millis() - lastEphPoll > EPH_POLL_INTERVAL_MS);
+                    if (fixGood && due) {
+                        gpsManager.pollEphemerides();
+                        // Replies trickle in over ~1 s at 38 400 baud; 2 s
+                        // is a safe ceiling. update() does the capturing.
+                        vTaskDelay(pdMS_TO_TICKS(2000));
+                        gpsManager.saveEphemeridesToNVS(nowEpoch);
+                        lastEphPoll = millis();
+                    }
                 }
             }
         } else {

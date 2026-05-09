@@ -1,4 +1,5 @@
 #include "schedule_manager.h"
+#include "log.h"
 #include "config.h"
 #include <Preferences.h>
 #include <ArduinoJson.h>
@@ -31,7 +32,7 @@ void ScheduleManager::checkWindow(DeviceState& state) {
 
     static bool lastActive = true;
     if (active != lastActive) {
-        Serial.printf("[SCHED] Window %s (local %02d:%02d)\n",
+        LOG("[SCHED] Window %s (local %02d:%02d)\n",
                       active ? "entered" : "exited", localHour, localMinute);
         lastActive = active;
     }
@@ -58,7 +59,7 @@ bool ScheduleManager::isInWindow(uint8_t hour, uint8_t minute) {
 void ScheduleManager::updateFromJSON(const char* json) {
     JsonDocument doc;
     if (deserializeJson(doc, json) != DeserializationError::Ok) {
-        Serial.println("[SCHED] Bad JSON — ignoring update");
+        LOG("[SCHED] Bad JSON — ignoring update");
         return;
     }
 
@@ -89,7 +90,7 @@ void ScheduleManager::updateFromJSON(const char* json) {
     }
 
     saveToNVS();
-    Serial.printf("[SCHED] Updated: %s, %d window(s)\n",
+    LOG("[SCHED] Updated: %s, %d window(s)\n",
                   _enabled ? "enabled" : "disabled", _windowCount);
 }
 

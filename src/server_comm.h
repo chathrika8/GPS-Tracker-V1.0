@@ -12,10 +12,6 @@ public:
     int    sendBatch(int maxCount);
     bool   testConnectivity();
 
-    // Fetch AssistNow MGA blob from the configured Worker route and copy
-    // up to *outLen bytes into out. Returns true on HTTP 200 with body.
-    bool   fetchAssistNow(uint8_t* out, size_t maxLen, size_t* outLen);
-
     // Force the keep-alive socket closed (e.g. on long idle, before sleep).
     void   closeSocket();
 

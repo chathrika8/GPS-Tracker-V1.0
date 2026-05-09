@@ -1,4 +1,5 @@
 #include "command_handler.h"
+#include "log.h"
 #include "gsm_manager.h"
 #include "wifi_manager.h"
 #include "schedule_manager.h"
@@ -10,7 +11,7 @@
 CommandHandler commandHandler;
 
 void CommandHandler::begin() {
-    Serial.println("[CMD] Ready.");
+    LOG("[CMD] Ready.");
 }
 
 void CommandHandler::pollAndExecute() {
@@ -25,7 +26,7 @@ void CommandHandler::pollAndExecute() {
 
     JsonDocument doc;
     if (deserializeJson(doc, response)) {
-        Serial.println("[CMD] Bad JSON in command response");
+        LOG("[CMD] Bad JSON in command response");
         return;
     }
 
@@ -34,7 +35,7 @@ void CommandHandler::pollAndExecute() {
         const char* command = cmd["command"];
         const char* params  = cmd["params"] | "";
 
-        Serial.printf("[CMD] %s\n", command);
+        LOG("[CMD] %s\n", command);
         executeCommand(command, params);
 
         // ACK — mark the command as executed on the server
@@ -50,7 +51,7 @@ void CommandHandler::pollAndExecute() {
             client.print(ackBody);
             client.flush();
             client.stop();
-            Serial.printf("[CMD] ACK sent: %s\n", id);
+            LOG("[CMD] ACK sent: %s\n", id);
         }
     }
 }
@@ -59,7 +60,7 @@ void CommandHandler::executeCommand(const char* command, const char* params) {
     if      (strcmp(command, "wifi_on")  == 0) { wifiManager.enable();  }
     else if (strcmp(command, "wifi_off") == 0) { wifiManager.disable(); }
     else if (strcmp(command, "reboot")   == 0) {
-        Serial.println("[CMD] Rebooting...");
+        LOG("[CMD] Rebooting...");
         ESP.restart();
     }
     else if (strcmp(command, "force_ota") == 0) {
@@ -88,10 +89,10 @@ void CommandHandler::executeCommand(const char* command, const char* params) {
     }
     else if (strcmp(command, "ble_on")  == 0 ||
              strcmp(command, "ble_off") == 0) {
-        Serial.println("[CMD] BLE control not yet implemented");
+        LOG("[CMD] BLE control not yet implemented");
     }
     else {
-        Serial.printf("[CMD] Unknown: %s\n", command);
+        LOG("[CMD] Unknown: %s\n", command);
     }
 }
 
