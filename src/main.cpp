@@ -245,6 +245,8 @@ void uplinkTask(void* param) {
 
     bool     agpsReseedTried = false;
     uint32_t lastSmsPoll = 0;  // seeded by smsManager.begin(); prevents immediate poll
+    uint32_t smsPollIntervalMs    = 30000;  // grows on consecutive failures
+    uint8_t  smsConsecutiveFails  = 0;
     uint32_t lastCellSave    = 0;
     uint32_t lastSendMs      = 0;
 
@@ -413,16 +415,29 @@ void uplinkTask(void* param) {
             gsmManager.ensureConnection();
         }
 
-        // ── SMS polling (rate-limited) ──
-        if (connected && lastSmsPoll != 0 && (millis() - lastSmsPoll > 30000)) {
+        // ── SMS polling (rate-limited, exponential backoff on failure) ──
+        if (connected && lastSmsPoll != 0 && (millis() - lastSmsPoll > smsPollIntervalMs)) {
             serverComm.closeSocket();  // release TCP before raw AT
-            smsManager.pollSms();
+            bool smsOk = smsManager.pollSms();
             lastSmsPoll = millis();
-            
-            // Copy SMS data into shared state
-            if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                smsManager.fillState(deviceState);
-                xSemaphoreGive(stateMutex);
+
+            if (smsOk) {
+                smsConsecutiveFails = 0;
+                smsPollIntervalMs   = 30000;
+
+                if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    smsManager.fillState(deviceState);
+                    xSemaphoreGive(stateMutex);
+                }
+            } else {
+                if (smsConsecutiveFails < 5) smsConsecutiveFails++;
+                // 60 s → 120 s → 240 s → 480 s → 600 s cap. Gives the
+                // modem room to recover instead of hammering it every 30 s.
+                uint32_t backoff = 60000UL * (1UL << (smsConsecutiveFails - 1));
+                if (backoff > 600000UL) backoff = 600000UL;
+                smsPollIntervalMs = backoff;
+                LOG("[SMS] Backoff %lu ms after %u consecutive failures\n",
+                    (unsigned long)smsPollIntervalMs, (unsigned)smsConsecutiveFails);
             }
         }
 
