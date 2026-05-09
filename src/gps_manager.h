@@ -76,9 +76,10 @@ struct DeviceState {
     // Schedule
     bool     schedule_active;   // currently in a tracking window?
 
-    // AGPS
-    bool     agps_injected;     // true once UBX-AID-INI / MGA bytes were sent
-    uint16_t agps_bytes;        // bytes streamed from AssistNow on last attempt
+    // AGPS — surfaced on the diagnostic display
+    char     agps_source[6];    // "NVS  ", "CELL ", "RESEED", "NONE "
+    uint8_t  agps_eph_count;    // ephemerides replayed on this boot
+    bool     agps_reseeded;     // true after cell tower triggered a re-seed
 };
 
 // Minimal stateful UBX frame parser. Runs side-by-side with TinyGPSPlus
@@ -115,18 +116,24 @@ public:
     void update();
     void fillState(DeviceState& state);
 
-    // Inject UTC + last-known position via UBX-AID-INI. Time epoch == 0 means
+    // Inject UTC + coarse position via UBX-AID-INI. Time epoch == 0 means
     // "skip time" (no GSM time sync yet). Lat/lon == 0 means "skip position".
+    // Sending AID-INI multiple times is allowed — each call overrides the
+    // previous, so we can re-seed once a fresher cell-tower position arrives.
     void injectAidIni(uint32_t utcEpoch, double lat, double lon, float altM);
 
-    // Stream a raw UBX/MGA blob (typically returned by the AssistNow Worker)
-    // straight to the GPS UART. The bytes are forwarded unmodified.
-    void injectAssistNowBlob(const uint8_t* data, size_t len);
-
-    // Persist the most recent valid fix to NVS so the next boot can seed
+    // Persist the most recent valid GPS fix to NVS so the next boot can seed
     // UBX-AID-INI without waiting for a fresh fix.
     void saveLastPositionToNVS(double lat, double lon, float altM, uint32_t epoch);
     bool loadLastPositionFromNVS(double* lat, double* lon, float* altM, uint32_t* epoch);
+
+    // Persist the most recent SIM800 cell-tower fix to NVS. Used as a fallback
+    // seed on boot when no GPS fix has been saved yet, and as a freshness
+    // anchor — if the cached cell position is older than the cached GPS fix,
+    // the GPS fix wins; otherwise (e.g. device was moved while off) the cell
+    // position wins.
+    void saveCellPositionToNVS(double lat, double lon, uint32_t epoch);
+    bool loadCellPositionFromNVS(double* lat, double* lon, uint32_t* epoch);
 
     // ── Local ephemeris cache ──
     // Send UBX-AID-EPH poll-all to the receiver. The replies (one per SV

@@ -116,14 +116,14 @@ void GPSManager::appendUbxChecksum(uint8_t* buf, size_t startIncl, size_t endExc
 }
 
 // ─────────────────────────────────────────────
-// AssistNow / cold-start helpers
+// Cold-start helpers
 // ─────────────────────────────────────────────
 //
 // UBX-AID-INI (class 0x0B, id 0x01) lets us hand the receiver a coarse
 // position so it doesn't have to download an almanac before searching for
-// satellites. We deliberately omit the time fields here — AssistNow Online
-// carries time data in its own MGA-INI-TIME message, and getting the BCD
-// date encoding wrong here would actually slow the receiver down.
+// satellites. Time fields are omitted here — getting the BCD date encoding
+// wrong would actively slow the receiver down, and the GPS will recover
+// time from the satellites within a couple of seconds anyway.
 void GPSManager::injectAidIni(uint32_t /*utcEpoch*/,
                               double lat, double lon, float altM) {
     if (lat == 0.0 && lon == 0.0) return;  // no useful seed
@@ -161,22 +161,8 @@ void GPSManager::injectAidIni(uint32_t /*utcEpoch*/,
     delay(50);
 }
 
-void GPSManager::injectAssistNowBlob(const uint8_t* data, size_t len) {
-    if (!data || len == 0 || !_serial) return;
-
-    // Stream in modest chunks so we don't overrun the UART TX FIFO.
-    const size_t CHUNK = 128;
-    size_t sent = 0;
-    while (sent < len) {
-        size_t n = (len - sent > CHUNK) ? CHUNK : (len - sent);
-        _serial->write(data + sent, n);
-        sent += n;
-        delay(10);
-    }
-}
-
 // ─────────────────────────────────────────────
-// Last-fix persistence (NVS)
+// Position persistence (NVS)
 // ─────────────────────────────────────────────
 void GPSManager::saveLastPositionToNVS(double lat, double lon, float altM,
                                        uint32_t epoch) {
@@ -196,6 +182,27 @@ bool GPSManager::loadLastPositionFromNVS(double* lat, double* lon,
         if (lat)   *lat   = gpsPrefs.getDouble("lat", 0.0);
         if (lon)   *lon   = gpsPrefs.getDouble("lon", 0.0);
         if (altM)  *altM  = gpsPrefs.getFloat ("alt", 0.0f);
+        if (epoch) *epoch = gpsPrefs.getUInt  ("ts",  0);
+    }
+    gpsPrefs.end();
+    return have;
+}
+
+void GPSManager::saveCellPositionToNVS(double lat, double lon, uint32_t epoch) {
+    gpsPrefs.begin("cell_last", false);
+    gpsPrefs.putDouble("lat", lat);
+    gpsPrefs.putDouble("lon", lon);
+    gpsPrefs.putUInt  ("ts",  epoch);
+    gpsPrefs.end();
+}
+
+bool GPSManager::loadCellPositionFromNVS(double* lat, double* lon,
+                                         uint32_t* epoch) {
+    gpsPrefs.begin("cell_last", true);
+    bool have = gpsPrefs.isKey("lat");
+    if (have) {
+        if (lat)   *lat   = gpsPrefs.getDouble("lat", 0.0);
+        if (lon)   *lon   = gpsPrefs.getDouble("lon", 0.0);
         if (epoch) *epoch = gpsPrefs.getUInt  ("ts",  0);
     }
     gpsPrefs.end();

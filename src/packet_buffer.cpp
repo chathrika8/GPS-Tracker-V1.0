@@ -1,4 +1,5 @@
 #include "packet_buffer.h"
+#include "log.h"
 #include "config.h"
 
 PacketBuffer packetBuffer;
@@ -7,9 +8,9 @@ const char* PacketBuffer::BUFFER_FILE = "/gps_buffer.bin";
 
 void PacketBuffer::begin() {
     if (!LittleFS.begin(true)) {
-        Serial.println("[BUF] LittleFS mount failed — formatting...");
+        LOG("[BUF] LittleFS mount failed — formatting...");
         if (!LittleFS.format() || !LittleFS.begin(false)) {
-            Serial.println("[BUF] LittleFS unrecoverable");
+            LOG("[BUF] LittleFS unrecoverable");
             return;
         }
     }
@@ -20,7 +21,7 @@ void PacketBuffer::begin() {
             _count       = f.size() / sizeof(GPSPacket);
             _writeOffset = f.size();
             f.close();
-            Serial.printf("[BUF] Resumed with %u packets\n", _count);
+            LOG("[BUF] Resumed with %u packets\n", _count);
         }
     }
 }
@@ -30,13 +31,13 @@ bool PacketBuffer::store(const GPSPacket& pkt) {
         // Buffer full — drop everything and start fresh. This is intentional:
         // after a very long outage the old data is stale anyway, and we'd
         // rather send fresh positions than flood the server with history.
-        Serial.println("[BUF] Full — clearing stale packets");
+        LOG("[BUF] Full — clearing stale packets");
         clear();
     }
 
     File f = LittleFS.open(BUFFER_FILE, FILE_APPEND);
     if (!f) {
-        Serial.println("[BUF] Open for write failed");
+        LOG("[BUF] Open for write failed");
         return false;
     }
 
@@ -117,5 +118,5 @@ void PacketBuffer::clear() {
     _readOffset  = 0;
     _writeOffset = 0;
     _count       = 0;
-    Serial.println("[BUF] Cleared");
+    LOG("[BUF] Cleared");
 }

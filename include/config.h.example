@@ -98,22 +98,25 @@
 #define GPS_UPDATE_RATE   5       // Hz
 
 // ============================================================
-//  AGPS — last-known position seed (always free)
+//  AGPS — coarse position seed + ephemeris cache (always free)
 // ============================================================
-// On every boot the firmware injects the last good fix from NVS into the
-// GPS via UBX-AID-INI before satellite search begins. This drops cold-
-// start TTFF from ~45–60 s to ~30 s. It's purely on-device — no token,
-// no network call, no cost.
+// On every boot the firmware injects a coarse position into the receiver
+// via UBX-AID-INI and replays cached ephemerides via UBX-AID-EPH so the
+// NEO-6M can skip the slow almanac search.
 //
-// AssistNow Online (the u-blox cloud service) is intentionally OFF below.
-// u-blox stopped issuing new tokens on 3 June 2025 and the service ends
-// of support on 31 May 2026. The free replacement (Predictive Orbits)
-// only supports Gen9/Gen10 modules — the NEO-6M is Gen6 so it's not
-// eligible. Leaving ASSISTNOW_ENABLE at 0 saves a pointless boot-time
-// HTTP round-trip that would always fail.
-#define ASSISTNOW_ENABLE   0
-#define ASSISTNOW_PATH     "/agps"        // Worker route, only used if enabled
-#define ASSISTNOW_MAX_LEN  4096           // hard cap on injected bytes
+// Position seed source priority:
+//   1. Last GPS fix from NVS (sub-km accurate)
+//   2. Cell-tower position from AT+CIPGSMLOC (1–5 km, works at first boot)
+//   3. None — fall back to standard cold-start
+// Once GSM is up, if the cell-tower position disagrees with the NVS seed
+// by more than AGPS_RESEED_KM kilometres, the firmware re-sends AID-INI
+// with the cell position. Catches the case where the device was carried
+// to a new location while powered off.
+#define GPS_NVS_SAVE_INTERVAL_MS   30000     // save GPS fix to NVS every 30 s
+#define CELL_NVS_SAVE_INTERVAL_MS  300000    // save cell fix to NVS every 5 min
+#define EPH_POLL_INTERVAL_MS       1800000   // refresh ephemeris cache every 30 min
+#define EPH_MAX_AGE_SEC            10800     // 3 h — broadcast eph validity
+#define AGPS_RESEED_KM             50        // re-seed if cell ≠ NVS by > N km
 
 // — Display —
 #define OLED_WIDTH   128

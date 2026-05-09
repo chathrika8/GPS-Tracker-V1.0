@@ -1,4 +1,5 @@
 #include "display_manager.h"
+#include "log.h"
 #include "packet_buffer.h"
 #include "config.h"
 
@@ -8,7 +9,7 @@ void DisplayManager::begin() {
     _display = new Adafruit_SH1107(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 
     if (!_display->begin(OLED_ADDR, true)) {
-        Serial.println("[DISP] SH1107 init failed!");
+        LOG("[DISP] SH1107 init failed!");
         return;
     }
 
@@ -54,7 +55,7 @@ void DisplayManager::begin() {
 
     delay(1500); // Hold logo on screen
 
-    Serial.println("[DISP] SH1107 ready.");
+    LOG("[DISP] SH1107 ready.");
 }
 
 void DisplayManager::render(const DeviceState& state) {

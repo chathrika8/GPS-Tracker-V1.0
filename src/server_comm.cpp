@@ -17,9 +17,6 @@
 #ifndef UPLINK_KEEPALIVE_MAX_AGE_MS
 #define UPLINK_KEEPALIVE_MAX_AGE_MS  60000
 #endif
-#ifndef ASSISTNOW_PATH
-#define ASSISTNOW_PATH  "/agps"
-#endif
 
 ServerComm serverComm;
 
@@ -322,77 +319,3 @@ bool ServerComm::testConnectivity() {
     return false;
 }
 
-// ─────────────────────────────────────────────
-// AssistNow fetch over the Cloudflare Worker
-// ─────────────────────────────────────────────
-// The Worker is expected to GET the u-blox AssistNow Online URL server-side
-// and stream the binary body back unmodified. We pull until the response
-// closes (or buffer fills) and copy the body into out.
-bool ServerComm::fetchAssistNow(uint8_t* out, size_t maxLen, size_t* outLen) {
-    if (outLen) *outLen = 0;
-    closeSocket();
-
-    TinyGsmClient& client = gsmManager.getClient();
-    if (!client.connect(PROXY_HOST, 80)) {
-        _lastHttpCode = -1;
-        _lastResponse = "AGPS CONN FAIL";
-        return false;
-    }
-
-    String req;
-    req.reserve(96);
-    req  = "GET ";  req += ASSISTNOW_PATH; req += " HTTP/1.1\r\n";
-    req += "Host: "; req += PROXY_HOST;    req += "\r\n";
-    req += "Connection: close\r\n\r\n";
-    client.print(req);
-
-    // Wait up to 10 s for headers to start arriving — AssistNow can be slow.
-    unsigned long deadline = millis() + 10000;
-    while (!client.available() && millis() < deadline) delay(20);
-    if (!client.available()) {
-        client.stop();
-        _lastHttpCode = -3;
-        _lastResponse = "AGPS NO RESP";
-        return false;
-    }
-
-    // Parse status line
-    String statusLine = client.readStringUntil('\n');
-    int code = 0;
-    int sp = statusLine.indexOf(' ');
-    if (sp > 0) code = statusLine.substring(sp + 1, sp + 4).toInt();
-    _lastHttpCode = code;
-
-    // Skip remaining headers
-    while (client.connected() || client.available()) {
-        if (!client.available()) { delay(10); continue; }
-        String line = client.readStringUntil('\n');
-        if (line == "\r" || line.length() <= 1) break;
-    }
-
-    if (code != 200) {
-        client.stop();
-        _lastResponse = "AGPS HTTP " + String(code);
-        return false;
-    }
-
-    size_t total = 0;
-    deadline = millis() + 10000;
-    while ((client.connected() || client.available()) && total < maxLen) {
-        if (!client.available()) {
-            if (millis() > deadline) break;
-            delay(10);
-            continue;
-        }
-        int n = client.read(out + total, maxLen - total);
-        if (n > 0) {
-            total += n;
-            deadline = millis() + 2000;  // refresh idle timeout per chunk
-        }
-    }
-
-    client.stop();
-    if (outLen) *outLen = total;
-    _lastResponse = "AGPS " + String((unsigned)total) + "B";
-    return total > 0;
-}

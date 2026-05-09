@@ -83,9 +83,9 @@ GPIO  1       ──► Button B (BACK / HANG)
 ## Features
 
 - **Real-time GPS** at up to 5 Hz with TinyGPSPlus (latitude, longitude, altitude, speed, course, HDOP, satellites)
-- **AGPS without u-blox** - cold-start TTFF dropped from ~45–60 s to **5–30 s** using only the local network and on-device storage:
-  1. Position seed via UBX-AID-INI — last fix from NVS (sub-km), or AT+CIPGSMLOC cell-tower lookup (~1–5 km) on first-ever boot
-  2. Ephemeris cache — every 30 min the firmware polls UBX-AID-EPH from the receiver, saves the ~3 KB blob to NVS, and replays it on the next boot if it's < 3 hours old
+- **AGPS without u-blox** - cold-start TTFF dropped from ~45–60 s to **5–30 s** using only the local network and on-device storage. Two-phase boot:
+  1. Phase 1 — immediate seed from NVS (last GPS fix saved every 30 s, plus a cell-tower position cached every 5 min). Ephemerides cached from the previous run are replayed via UBX-AID-EPH if they're < 3 h old.
+  2. Phase 2 — once GPRS is up, AT+CIPGSMLOC cell-tower lookup runs. If the cell position disagrees with the NVS seed by > 50 km (i.e. the device was carried somewhere while powered off) AND GPS still hasn't fixed, AID-INI is re-sent with the fresher cell position.
   No tokens, no external services, no API keys.
 - **GSM/GPRS data uplink** to a Cloudflare-proxied REST API backed by Supabase, using a persistent HTTP/1.1 keep-alive socket so each batch skips the 2G TCP handshake
 - **Two wire formats** - compact binary (~20 B/packet) or short-key JSON (~80 B/packet), selectable from `config.h` so the same firmware can A/B test both on the same Worker
@@ -355,24 +355,38 @@ The firmware opens **one** TCP socket to the Worker and reuses it for up to `UPL
 
 #### AGPS — local cache + cell-tower seed
 
-The NEO-6M cold-starts in 45–60 s without any assistance. The firmware accelerates this using only resources we already pay for (the SIM and the on-board flash), no third-party AGPS service:
+The NEO-6M cold-starts in 45–60 s without any assistance. The firmware accelerates this using only resources we already pay for (the SIM and the on-board flash), no third-party AGPS service. The flow mirrors how a smartphone does it, minus the SUPL protocol (which the SIM800L can't run anyway).
 
-1. **Position seed via UBX-AID-INI.** On every boot, the firmware seeds the receiver with a coarse position so it can skip the almanac search:
-   - **Best**: the last good fix saved to NVS once a minute (sub-km accurate).
-   - **Fallback**: `AT+CIPGSMLOC=1,1` returns cell-tower-derived lat/lon from the SIM800 firmware's built-in lookup. Accuracy is ~1–5 km, which is plenty for AID-INI. Used on first-ever boot when NVS is empty.
-   - **Last resort**: skip the seed and let the receiver cold-start as before.
-2. **Ephemeris cache.** Every 30 minutes (gated on a stable fix with ≥ 6 satellites), the firmware sends `UBX-AID-EPH` poll-all to the receiver, captures the binary replies via a UBX parser running alongside TinyGPSPlus, and writes the resulting ~3 KB blob to NVS along with the GPS-derived UTC. On the next boot — if the cache is < 3 hours old — those frames are replayed directly to the receiver, dropping TTFF to **5–30 s**.
+**Continuous saving while running:**
 
-##### A note on u-blox AssistNow Online
+| Source | Cadence | NVS namespace | Purpose |
+|---|---|---|---|
+| GPS fix (when valid) | 30 s | `gps_last` | Best coarse position for the next boot |
+| Cell-tower fix (when GPRS up) | 5 min | `cell_last` | Freshness anchor — survives a move while powered off |
+| Ephemerides (when fix ≥ 6 sats) | 30 min | `gps_eph` | Skip almanac search on the next boot |
 
-The original v1.1 plan was also to fetch live ephemerides from u-blox's AssistNow Online service over GPRS. That plan is no longer viable:
+**Two-phase boot:**
+
+1. **Phase 1 — immediate (no waiting for GSM).** The firmware loads both saved positions from NVS, picks the more recent one as the AID-INI seed, and replays the cached ephemerides if they're < 3 h old. The NEO-6M starts searching with a strong head start.
+2. **Phase 2 — after GPRS is up.** `AT+CIPGSMLOC=1,1` returns the SIM800's cell-tower-derived lat/lon (handled internally by SIM800 firmware, ~1–5 km accurate). The firmware compares it to the seed it already injected:
+   - If GPS already has a fix → just save the cell position to NVS for next time.
+   - If GPS hasn't fixed yet AND the cell position disagrees with the seed by more than 50 km → the device was clearly carried somewhere new while off. The firmware re-sends UBX-AID-INI with the cell position. The receiver throws away its stale satellite search list and starts hunting visible satellites in the new location.
+
+**Result:** TTFF drops from 45–60 s to:
+- **5–30 s** when warm (NVS + ephemeris cache valid, device hasn't moved)
+- **20–40 s** when device was moved (re-seed kicks in once GSM is up)
+- **30–35 s** on first-ever boot (cell-tower seed only, no NVS history)
+
+##### Why no u-blox AssistNow
+
+The earlier v1.1 plan was to fetch live ephemerides from u-blox's AssistNow Online service over GPRS. That's no longer possible:
 
 - u-blox stopped issuing AssistNow Online tokens on **3 June 2025**.
 - End of Maintenance and End of Support are **31 May 2026**.
 - The free replacement (AssistNow Predictive Orbits) only supports Gen9/Gen10 receivers — the NEO-6M is Gen6 and not eligible.
-- There is no paid alternative for the NEO-6M either.
+- No paid plan exists for the NEO-6M either.
 
-`ASSISTNOW_ENABLE` therefore defaults to `0` in `config.h.example`. The `/agps` route in the Cloudflare Worker is left in place for future use (it returns 503 if no token is configured) but the device won't call it. The cache + cell-tower path above gives most of the same TTFF benefit without a u-blox account.
+All AssistNow code has been removed from both the firmware and the Cloudflare Worker. The local-cache + cell-tower path above gives most of the same TTFF benefit without a u-blox account.
 
 ### OTA Updates (GitHub + Supabase)
 

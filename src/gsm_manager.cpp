@@ -1,4 +1,5 @@
 #include "gsm_manager.h"
+#include "log.h"
 #include "config.h"
 
 GSMManager gsmManager;
@@ -14,35 +15,35 @@ void GSMManager::begin() {
     _modem  = new TinyGsm(*_serial);
     _client = new TinyGsmClient(*_modem);
 
-    Serial.println("[GSM] Initializing modem...");
+    LOG("[GSM] Initializing modem...");
 
     pinMode(SIM800L_RST, OUTPUT);
     resetModem();
 
     if (!_modem->restart()) {
-        Serial.println("[GSM] Modem restart failed, falling back to init()");
+        LOG("[GSM] Modem restart failed, falling back to init()");
         _modem->init();
     }
 
-    Serial.printf("[GSM] Modem: %s\n", _modem->getModemInfo().c_str());
+    LOG("[GSM] Modem: %s\n", _modem->getModemInfo().c_str());
 
     // Network registration and GPRS are handled by the Uplink task so
     // that a slow SIM attach doesn't block setup() and freeze the display.
 }
 
 bool GSMManager::connectGPRS() {
-    Serial.printf("[GSM] Connecting GPRS (APN: %s)...\n", GPRS_APN);
+    LOG("[GSM] Connecting GPRS (APN: %s)...\n", GPRS_APN);
     if (!_modem->gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS)) {
-        Serial.println("[GSM] GPRS connect failed");
+        LOG("[GSM] GPRS connect failed");
         return false;
     }
-    Serial.println("[GSM] GPRS up");
+    LOG("[GSM] GPRS up");
     return true;
 }
 
 void GSMManager::ensureConnection() {
     if (!_modem->isNetworkConnected()) {
-        Serial.println("[GSM] Lost network — waiting for re-registration...");
+        LOG("[GSM] Lost network — waiting for re-registration...");
         unsigned long start = millis();
         // Use vTaskDelay instead of delay() so the FreeRTOS watchdog stays fed
         while (!_modem->isNetworkConnected() && (millis() - start < 30000L)) {
@@ -50,7 +51,7 @@ void GSMManager::ensureConnection() {
         }
     }
     if (!_modem->isGprsConnected()) {
-        Serial.println("[GSM] GPRS down — reconnecting...");
+        LOG("[GSM] GPRS down — reconnecting...");
         connectGPRS();
     }
 }
@@ -157,7 +158,7 @@ void GSMManager::setAlarm(const char* datetime) {
     String cmd = "AT+CALA=\"" + String(datetime) + "\",0,0,\"GPS\"";
     _modem->sendAT(cmd.c_str());
     _modem->waitResponse(1000);
-    Serial.printf("[GSM] RTC alarm set: %s\n", datetime);
+    LOG("[GSM] RTC alarm set: %s\n", datetime);
 }
 
 void GSMManager::clearAlarm() {
@@ -171,5 +172,5 @@ void GSMManager::setFunctionality(int mode) {
     String cmd = "+CFUN=" + String(mode);
     _modem->sendAT(cmd.c_str());
     _modem->waitResponse(5000);
-    Serial.printf("[GSM] CFUN=%d\n", mode);
+    LOG("[GSM] CFUN=%d\n", mode);
 }
