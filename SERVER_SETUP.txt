@@ -5,8 +5,22 @@
 This is the server-side counterpart to the firmware on this branch
 (claude/optimize-2g-performance-tvWaR). The firmware now sends a
 compact binary frame over plain HTTP and expects an /agps route for
-AssistNow. The existing Worker only understands the old verbose JSON
+AssistNow. The previous Worker only understood the old verbose JSON
 format, so it must be replaced (or extended) with the script below.
+
+The new Worker is a drop-in replacement for the previous one — it:
+
+  * Keeps the SUPABASE_URL and anon key INLINE in the file (same style
+    as the previous Worker; no env vars to set).
+  * Keeps the catch-all pass-through to /rest/v1/<anything> so the
+    OTA fetch and command poller keep working.
+  * Adds POST /uplink support for BOTH the new binary frame and the
+    new short-key JSON, AND still accepts the old verbose JSON so
+    devices that haven't been re-flashed yet keep working.
+  * Adds GET /agps for AssistNow.
+  * Maps every payload format to the SAME Supabase row shape your
+    existing dashboard already understands (timestamp as ISO-8601,
+    fw_version included).
 
 -----------------------------------------------------------------
   REQUEST FLOW
@@ -14,33 +28,31 @@ format, so it must be replaced (or extended) with the script below.
 
    Device                         Cloudflare Worker             u-blox / Supabase
    ──────                         ─────────────────             ─────────────────
-   POST /uplink   ──────►         decode binary or JSON         POST /rest/v1/locations
-   (octet-stream                  expand batch → N rows         (HTTPS, TLS 1.3)
-   or short-key                   inject Supabase apikey  ────► Supabase
-   JSON, ~110 B                   server-side
-   for 5 packets)
+   POST /uplink   ──────►         decode binary OR              POST /rest/v1/locations
+   (octet-stream                  short-key JSON OR             (HTTPS, anon key)
+   or any JSON)                   verbose JSON, expand     ───► Supabase
+                                  batch → N rows
 
-   GET /agps      ──────►         fetch online-live1.services   GET ?token=…
-                                  .u-blox.com/GetOnlineData.    ────► u-blox AssistNow
-                                  ashx?token=…
+   GET  /agps     ──────►         fetch online-live1.services
+                                  .u-blox.com/GetOnlineData   ───► u-blox AssistNow
+                                  .ashx?token=…
                   ◄──────         binary body passthrough  ◄────
 
+   * /anything    ──────►         prefix /rest/v1/, forward
+                                  with anon key                  ───► Supabase REST
+
 -----------------------------------------------------------------
-  CLOUDFLARE WORKER SECRETS / VARS
+  WHAT YOU NEED TO PASTE INTO THE WORKER
 -----------------------------------------------------------------
 
-In the Worker dashboard → Settings → Variables, add these. Use
-"Encrypt" for the secrets so they aren't visible in the UI.
+Edit two constants near the top of the file:
 
-  SUPABASE_URL       https://<project-ref>.supabase.co
-  SUPABASE_KEY       (encrypted) Supabase service_role key
-  SUPABASE_TABLE     locations            (optional; defaults to "locations")
-  ASSISTNOW_TOKEN    (encrypted) your u-blox AssistNow token
-  DEVICE_MAP         {"0xc0ffee01":"GPS-001"}    (optional)
+  ASSISTNOW_TOKEN   your u-blox AssistNow Online token (sign up
+                    at https://www.thingstream.io, free tier).
+  DEVICE_MAP        optional: maps the FNV-1a hash of each device's
+                    DEVICE_ID back to the human-readable string.
 
-DEVICE_MAP is a JSON object mapping the FNV-1a hash of each device's
-DEVICE_ID (8-char hex with "0x" prefix) to its human-readable ID.
-The hash for any DEVICE_ID can be computed with:
+To compute the hash for "GPS-001":
 
   printf "GPS-001" | python3 -c '
   import sys
@@ -50,102 +62,135 @@ The hash for any DEVICE_ID can be computed with:
   print("0x%08x" % h)
   '
 
-If a hash isn't in DEVICE_MAP, the Worker falls back to storing the
-raw hex hash in the device_id column so nothing is lost.
+If a hash isn't in DEVICE_MAP, the Worker stores the raw hex hash in
+device_id so nothing is ever silently dropped.
+
+The SUPABASE_URL and SUPABASE_KEY constants stay where they were in
+the previous Worker — exactly the same anon key, no rotation needed.
 
 -----------------------------------------------------------------
   CLOUDFLARE WORKER CODE — paste into worker.js
 -----------------------------------------------------------------
 
 // gps-tracker-worker.js
-// Cloudflare Worker for GPS-Tracker-V1.0 (firmware ≥ 1.1.0).
+// Cloudflare Worker for GPS-Tracker-V1.0 firmware (handles v1.0.x and v1.1.x).
+
+const SUPABASE_URL = 'https://wwsiimmmkrhieumkrkhq.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind3c2lpbW1ta3JoaWV1bWtya2hxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQyMzg2NTcsImV4cCI6MjA4OTgxNDY1N30.9sPJnJZnWssEwX9TJUQ_p6Pi3MJk_RuP-lgO9NPk1kY';
+
+// Paste your u-blox AssistNow Online token here (https://www.thingstream.io)
+const ASSISTNOW_TOKEN = 'PASTE_YOUR_UBLOX_TOKEN_HERE';
+
+// Optional: device_id hash → friendly name. Leave {} to fall back to hex.
+const DEVICE_MAP = {
+  // '0xc0ffee01': 'GPS-001',
+};
+
+// Used as the fw_version on rows decoded from the binary frame, which
+// doesn't carry a version string of its own.
+const BIN_FW_FALLBACK = '1.1.0';
 
 const HEADER_LEN = 11;
 const PACKET_LEN = 20;
+
+const SUPA_HEADERS = {
+  'apikey':        SUPABASE_KEY,
+  'Authorization': `Bearer ${SUPABASE_KEY}`,
+  'Content-Type':  'application/json',
+  'Prefer':        'return=minimal',
+};
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname === '/uplink' && request.method === 'POST') {
-      return handleUplink(request, env, ctx);
+      return handleUplink(request);
     }
     if (url.pathname === '/agps' && request.method === 'GET') {
-      return handleAgps(env);
+      return handleAgps();
     }
     if (url.pathname === '/health') {
       return new Response('ok', { status: 200 });
     }
-    return new Response('Not found', { status: 404 });
+
+    // Pass-through for everything else (commands, OTA, dashboard reads).
+    return handlePassthrough(request, url);
   },
 };
 
 // ─── /uplink ────────────────────────────────────────────────────
-async function handleUplink(request, env, ctx) {
+async function handleUplink(request) {
   const ct = (request.headers.get('content-type') || '').toLowerCase();
   let rows;
-
   try {
     if (ct.includes('application/octet-stream')) {
       const buf = new Uint8Array(await request.arrayBuffer());
-      rows = decodeBinary(buf, env);
-    } else if (ct.includes('application/json')) {
-      const body = await request.json();
-      rows = decodeShortJson(body, env);
+      rows = decodeBinary(buf);
     } else {
-      return new Response(`Unsupported content-type: ${ct}`, { status: 415 });
+      // Both the new short-key and the old verbose JSON land here.
+      const body = await request.json();
+      rows = decodeAnyJson(body);
     }
   } catch (e) {
-    console.warn(`decode error: ${e.message}`);
-    return new Response(`decode: ${e.message}`, { status: 400 });
+    return new Response(`DECODE: ${e.message}`, { status: 400 });
   }
 
-  if (!rows.length) return new Response('ok (empty)', { status: 200 });
+  if (!rows.length) return new Response('OK (empty)', { status: 200 });
 
-  // Fire-and-wait insert. Worker has plenty of CPU budget; a synchronous
-  // insert lets us return a real status code to the device for diagnostics.
-  const table = env.SUPABASE_TABLE || 'locations';
-  const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
-    method: 'POST',
-    headers: {
-      'apikey': env.SUPABASE_KEY,
-      'Authorization': `Bearer ${env.SUPABASE_KEY}`,
-      'Content-Type': 'application/json',
-      'Prefer': 'return=minimal',
-    },
-    body: JSON.stringify(rows),
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/locations`, {
+    method:  'POST',
+    headers: SUPA_HEADERS,
+    body:    JSON.stringify(rows),
   });
-
-  if (!resp.ok) {
-    const t = await resp.text();
-    console.error(`supabase ${resp.status}: ${t}`);
-    return new Response(`supabase ${resp.status}`, { status: 502 });
+  if (!r.ok) {
+    const t = await r.text();
+    return new Response(`SUPABASE: ${t}`, { status: r.status });
   }
-  return new Response(`ok (${rows.length})`, { status: 200 });
+  return new Response(`OK (${rows.length})`, { status: 200 });
 }
 
 // ─── /agps ──────────────────────────────────────────────────────
-async function handleAgps(env) {
-  if (!env.ASSISTNOW_TOKEN) {
+async function handleAgps() {
+  if (!ASSISTNOW_TOKEN || ASSISTNOW_TOKEN.startsWith('PASTE_')) {
     return new Response('ASSISTNOW_TOKEN not configured', { status: 503 });
   }
   const upstream = 'https://online-live1.services.u-blox.com/GetOnlineData.ashx'
-    + `?token=${encodeURIComponent(env.ASSISTNOW_TOKEN)}`
+    + `?token=${encodeURIComponent(ASSISTNOW_TOKEN)}`
     + ';gnss=gps;datatype=eph,alm,aux,pos;'
-    + ';format=aid';   // NEO-6M speaks UBX-AID-* (older protocol)
-
+    + ';format=aid';   // NEO-6M speaks the older UBX-AID-* protocol
   const r = await fetch(upstream);
   if (!r.ok) {
     const t = await r.text();
-    console.error(`u-blox ${r.status}: ${t}`);
-    return new Response(`u-blox ${r.status}`, { status: 502 });
+    return new Response(`UBLOX: ${t}`, { status: 502 });
   }
-  // Stream the binary body straight back. Content-Type must be octet-stream
-  // so the device's HTTP parser treats it opaquely.
   return new Response(r.body, {
-    status: 200,
+    status:  200,
     headers: { 'Content-Type': 'application/octet-stream' },
   });
+}
+
+// ─── Generic pass-through (commands, OTA, dashboard reads) ─────
+async function handlePassthrough(request, url) {
+  try {
+    let path = url.pathname;
+    if (!path.startsWith('/rest/v1/')) {
+      path = '/rest/v1/' + path.replace(/^\//, '');
+    }
+    const targetUrl = `${SUPABASE_URL}${path}${url.search}`;
+    const opts = { method: request.method, headers: SUPA_HEADERS };
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      opts.body = await request.text();
+    }
+    const r = await fetch(targetUrl, opts);
+    if (!r.ok) {
+      const t = await r.text();
+      return new Response(`SUPABASE: ${t}`, { status: r.status });
+    }
+    return new Response(r.body, { status: r.status });
+  } catch (e) {
+    return new Response(`PROXY ERROR: ${e.message}`, { status: 500 });
+  }
 }
 
 // ─── Binary decoder ─────────────────────────────────────────────
@@ -154,27 +199,26 @@ async function handleAgps(env) {
 //   Per packet (20 B): ts u32 | lat i32×1e7 | lon i32×1e7 | alt i16
 //                       | speed u8×0.5 | course u8×2 | sats u8
 //                       | hdop u8/10 | gsm u8 | batt u8 (3.0+x/100)
-function decodeBinary(buf, env) {
+function decodeBinary(buf) {
   if (buf.length < HEADER_LEN) throw new Error('header truncated');
   if (buf[0] !== 0x47)         throw new Error(`magic: ${buf[0].toString(16)}`);
   if (buf[1] !== 0x01)         throw new Error(`version: ${buf[1]}`);
 
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   const deviceHash = dv.getUint32(2, true);
-  const bufCount   = dv.getUint32(6, true);
   const n          = buf[10];
-
   if (buf.length < HEADER_LEN + n * PACKET_LEN) {
     throw new Error(`body truncated: ${buf.length} < ${HEADER_LEN + n * PACKET_LEN}`);
   }
+  const deviceId = resolveDevice(deviceHash);
 
-  const deviceId = resolveDevice(deviceHash, env);
   const rows = [];
   for (let i = 0; i < n; i++) {
     const o = HEADER_LEN + i * PACKET_LEN;
     rows.push({
       device_id : deviceId,
-      timestamp : dv.getUint32(o + 0, true),
+      fw_version: BIN_FW_FALLBACK,
+      timestamp : new Date(dv.getUint32(o + 0, true) * 1000).toISOString(),
       latitude  : dv.getInt32 (o + 4, true) / 1e7,
       longitude : dv.getInt32 (o + 8, true) / 1e7,
       altitude_m: dv.getInt16 (o + 12, true),
@@ -184,155 +228,133 @@ function decodeBinary(buf, env) {
       hdop      : buf[o + 17] / 10.0,
       gsm_signal: buf[o + 18],
       battery_v : 3.0 + buf[o + 19] / 100.0,
-      buf_depth : bufCount,
     });
   }
   return rows;
 }
 
-// ─── Short-key JSON decoder ─────────────────────────────────────
-// {"d":"GPS-001","f":"1.1.0","b":12,"p":[[ts,lat,lon,alt,sp,co,sa,hd,gs,bv]]}
-function decodeShortJson(body, env) {
-  if (!body || !Array.isArray(body.p)) throw new Error('missing "p" array');
-  const deviceId = String(body.d || 'unknown');
-  const bufCount = Number(body.b || 0);
-  const rows = [];
-  for (const r of body.p) {
-    if (!Array.isArray(r) || r.length < 10) continue;
-    rows.push({
-      device_id : deviceId,
-      timestamp : r[0],
-      latitude  : r[1],
-      longitude : r[2],
-      altitude_m: r[3],
-      speed_kmh : r[4],
-      course    : r[5],
-      satellites: r[6],
-      hdop      : r[7],
-      gsm_signal: r[8],
-      battery_v : r[9],
-      buf_depth : bufCount,
-    });
+// ─── JSON decoder (short-key v1.1 + verbose legacy v1.0) ───────
+function decodeAnyJson(body) {
+  if (!body || typeof body !== 'object') throw new Error('not an object');
+
+  // Detect format by the array key. v1.1 uses "p", v1.0 used "packets".
+  if (Array.isArray(body.p)) {
+    const deviceId  = String(body.d || 'unknown');
+    const fwVersion = String(body.f || BIN_FW_FALLBACK);
+    return body.p
+      .filter(r => Array.isArray(r) && r.length >= 10)
+      .map(r => ({
+        device_id : deviceId,
+        fw_version: fwVersion,
+        timestamp : new Date(r[0] * 1000).toISOString(),
+        latitude  : r[1],
+        longitude : r[2],
+        altitude_m: r[3],
+        speed_kmh : r[4],
+        course    : r[5],
+        satellites: r[6],
+        hdop      : r[7],
+        gsm_signal: r[8],
+        battery_v : r[9],
+      }));
   }
-  return rows;
+
+  if (Array.isArray(body.packets)) {
+    const deviceId  = String(body.device_id || 'unknown');
+    const fwVersion = String(body.fw_ver || BIN_FW_FALLBACK);
+    return body.packets.map(p => ({
+      device_id : deviceId,
+      fw_version: fwVersion,
+      timestamp : new Date(p.ts * 1000).toISOString(),
+      latitude  : p.lat,
+      longitude : p.lon,
+      altitude_m: p.alt_m,
+      speed_kmh : p.speed_kmh,
+      course    : p.course,
+      satellites: p.sats,
+      hdop      : p.hdop,
+      gsm_signal: p.gsm_signal,
+      battery_v : p.batt_v,
+    }));
+  }
+
+  throw new Error('no "p" or "packets" array');
 }
 
 // ─── Device hash → friendly id ──────────────────────────────────
-function resolveDevice(hash, env) {
+function resolveDevice(hash) {
   const hex = '0x' + hash.toString(16).padStart(8, '0');
-  if (env.DEVICE_MAP) {
-    try {
-      const map = typeof env.DEVICE_MAP === 'string'
-        ? JSON.parse(env.DEVICE_MAP) : env.DEVICE_MAP;
-      if (map[hex]) return map[hex];
-    } catch (_) {
-      // fall through to hex
-    }
-  }
-  return hex;
+  return DEVICE_MAP[hex] || hex;
 }
 
 -----------------------------------------------------------------
-  SUPABASE — SQL CHANGES
+  SUPABASE — SCHEMA NOTES (NO MIGRATION REQUIRED)
 -----------------------------------------------------------------
 
-The existing locations table mostly works. Two small changes:
+Your current locations table is already compatible with this Worker.
+The Worker emits exactly the same column shape your previous one did
+(device_id, fw_version, timestamp ISO-8601, latitude, longitude,
+altitude_m, speed_kmh, course, satellites, hdop, gsm_signal,
+battery_v). No NULLs in any column, no schema change required.
 
-  1. Add a buf_depth column so the Worker can record the device's
-     buffer queue depth at send time. Useful for diagnostics
-     (lets you spot when the device is falling behind).
-  2. Add an index on (device_id, timestamp DESC) so latest-position
-     queries stay fast when the table grows.
-  3. Add created_at timestamptz so you can tell when a row was
-     ingested vs when the GPS sample was actually taken (the two
-     can diverge by minutes if the device buffered through an
-     outage).
+If you DO want the diagnostic / faster-query columns I suggested
+earlier, run this in the Supabase SQL editor — but it is purely
+optional and the firmware works without it:
 
-Run this in the Supabase SQL editor:
-
-  -- 1. New columns. Both are nullable, so this won't break old inserts
-  --    and existing rows simply have NULL for buf_depth / created_at.
-  ALTER TABLE locations
-    ADD COLUMN IF NOT EXISTS buf_depth   integer,
-    ADD COLUMN IF NOT EXISTS created_at  timestamptz;
-
-  -- 2. Apply the now() default in a second step. If we did this in step 1,
-  --    Postgres would treat now() as a volatile default and rewrite the
-  --    whole table, stamping every historical row with the same migration
-  --    timestamp — misleading. Splitting it leaves old rows as NULL and
-  --    auto-stamps only future inserts.
-  ALTER TABLE locations
-    ALTER COLUMN created_at SET DEFAULT now();
-
-  -- 3. Index for "latest fix per device" queries.
+  -- Latency-friendly index for "latest fix per device" reads.
   CREATE INDEX IF NOT EXISTS locations_device_ts_idx
     ON locations (device_id, timestamp DESC);
 
-  -- 4. Optional: index on created_at for "recent ingestions" dashboards.
-  CREATE INDEX IF NOT EXISTS locations_created_at_idx
-    ON locations (created_at DESC);
+  -- Optional ingestion-time stamp (separate from GPS sample time).
+  ALTER TABLE locations ADD COLUMN IF NOT EXISTS created_at timestamptz;
+  ALTER TABLE locations ALTER COLUMN created_at SET DEFAULT now();
 
-If you want stricter validation, you can also add CHECK constraints:
+(Splitting the ADD COLUMN and SET DEFAULT avoids a full table rewrite
+that would otherwise stamp every historical row with the same
+migration-time timestamp. Existing rows stay NULL on created_at; only
+new rows get auto-stamped.)
 
-  ALTER TABLE locations
-    ADD CONSTRAINT locations_lat_range  CHECK (latitude  BETWEEN -90  AND 90),
-    ADD CONSTRAINT locations_lon_range  CHECK (longitude BETWEEN -180 AND 180),
-    ADD CONSTRAINT locations_speed_pos  CHECK (speed_kmh >= 0);
+If you'd like the buf_depth diagnostic (queue-depth-at-send-time), add
+buf_depth to BOTH the column list:
 
-These are cheap to add now and catch bad data from a corrupted decode.
+  ALTER TABLE locations ADD COLUMN IF NOT EXISTS buf_depth integer;
 
------------------------------------------------------------------
-  ROW-LEVEL SECURITY (only if you have RLS enabled)
------------------------------------------------------------------
-
-If RLS is enabled on locations, the Worker needs the service_role key
-(which bypasses RLS) — that's what SUPABASE_KEY is set to above. Your
-end-user dashboard should use the anon key with a SELECT policy:
-
-  CREATE POLICY "read locations" ON locations
-    FOR SELECT TO anon
-    USING (true);   -- or scope by auth.uid() if you have user accounts
-
-The Worker's service_role key MUST NOT be exposed client-side.
+…and then add `buf_depth: bufCount,` to each row in the Worker's three
+decoders. I left it out of the default code to keep the row shape
+exactly identical to your current production rows.
 
 -----------------------------------------------------------------
   STEP-BY-STEP DEPLOY
 -----------------------------------------------------------------
 
-  1. Run the SQL block above in the Supabase SQL editor.
-  2. Sign up at https://www.thingstream.io for AssistNow Online.
-     Get your token from the "Location Services" → "Credentials" page.
-     Free tier covers ~1000 requests/day, plenty for one device.
-  3. In Cloudflare → Workers & Pages → your Worker → Quick Edit,
-     replace the contents with the JS block above and click "Save and Deploy".
-  4. Workers → your Worker → Settings → Variables — set:
-        SUPABASE_URL, SUPABASE_KEY (encrypted), SUPABASE_TABLE,
-        ASSISTNOW_TOKEN (encrypted), DEVICE_MAP.
-  5. Workers → your Worker → Settings → Triggers — confirm that
-     api.<yourdomain>.com/* still routes to this Worker.
-  6. Smoke tests from any shell:
-        # Health
+  1. Sign up at https://www.thingstream.io for AssistNow Online.
+     Free tier covers ~1000 fetches/day, plenty for one device.
+     Copy the token.
+  2. In Cloudflare → Workers & Pages → your Worker → Edit Code,
+     replace the contents with the JS block above.
+  3. Paste your AssistNow token into the ASSISTNOW_TOKEN constant.
+     (Optional: fill in DEVICE_MAP with your device IDs.)
+  4. Save and Deploy.
+  5. Smoke tests:
         curl https://api.<yourdomain>.com/health
-        # AGPS — should return ~3 KB of binary
-        curl -s https://api.<yourdomain>.com/agps -o agps.bin && wc -c agps.bin
-        # Uplink — empty body should round-trip without crashing
+        curl -s https://api.<yourdomain>.com/agps -o agps.bin
+        wc -c agps.bin                 # expect ~3 KB
+        # Old-format JSON should still ingest:
         curl -X POST https://api.<yourdomain>.com/uplink \
-             -H 'Content-Type: application/octet-stream' \
-             --data-binary @/dev/null
-  7. Flash the firmware on this branch and watch the Cloudflare
-     Worker logs (Logs tab, "Live") — you should see one POST every
-     ~5 s with "ok (5)" replies, and one GET /agps shortly after boot.
+             -H 'Content-Type: application/json' \
+             -d '{"device_id":"GPS-001","fw_ver":"1.0.0",
+                  "packets":[{"ts":1714000000,"lat":6.9271,"lon":79.8612,
+                  "alt_m":10,"speed_kmh":0,"course":0,"sats":7,
+                  "hdop":1.2,"gsm_signal":80,"batt_v":3.9}]}'
+  6. Flash the firmware on this branch and watch the Worker logs
+     (Logs → Live tail). Expect one POST every ~5 s with "OK (5)"
+     and one GET /agps shortly after boot.
 
 -----------------------------------------------------------------
   ROLLBACK
 -----------------------------------------------------------------
 
-If anything goes wrong, the previous Worker version is in your
-Cloudflare deploy history (Workers → your Worker → Deployments).
-You can roll back with one click. The firmware on the device will
-keep retrying — packets that fail to send are dropped per the
-fire-and-forget design, so no manual cleanup is needed.
-
-The SQL changes are all additive (ADD COLUMN IF NOT EXISTS, CREATE
-INDEX IF NOT EXISTS), so they're safe to leave in place even if you
-roll back the Worker.
+If anything goes wrong, the previous Worker version is one click
+away in Workers → your Worker → Deployments. The firmware on the
+device retries on the next cycle, so no data is permanently lost
+beyond the in-flight batch.
