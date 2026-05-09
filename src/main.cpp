@@ -119,11 +119,6 @@ void gpsTask(void* param) {
 // Buffer Task — Save GPS packets to SPIFFS
 // ─────────────────────────────────────────────
 void bufferTask(void* param) {
-    // Persist the most recent fix to NVS once a minute so the next boot can
-    // seed UBX-AID-INI with a coarse position. Cheap insurance against the
-    // NEO-6M's lack of a backup battery on most cheap dev boards.
-    static uint32_t lastNvsWrite = 0;
-
     for (;;) {
         bool moving = false;
 
@@ -147,15 +142,6 @@ void bufferTask(void* param) {
                 pkt.battery_v  = deviceState.battery_voltage;
 
                 packetBuffer.store(pkt);
-
-                if (millis() - lastNvsWrite > 60000UL) {
-                    gpsManager.saveLastPositionToNVS(
-                        deviceState.latitude,
-                        deviceState.longitude,
-                        (float)deviceState.altitude_m,
-                        deviceState.utc_epoch);
-                    lastNvsWrite = millis();
-                }
             }
             xSemaphoreGive(stateMutex);
         }
@@ -177,44 +163,9 @@ void uplinkTask(void* param) {
         xSemaphoreGive(stateMutex);
     }
 
-    bool agpsDone   = false;   // AssistNow / AID-INI runs once per boot
-    uint32_t lastSendMs = 0;
-
     for (;;) {
         bool connected = gsmManager.isGprsConnected();
         bool registered = gsmManager.isRegistered();
-
-        // ── AGPS bring-up: run once when GPRS first comes up ──
-        if (connected && !agpsDone) {
-            // Seed receiver with last-known position from NVS
-            double lastLat = 0, lastLon = 0;
-            float  lastAlt = 0;
-            uint32_t lastTs = 0;
-            if (gpsManager.loadLastPositionFromNVS(&lastLat, &lastLon, &lastAlt, &lastTs)) {
-                Serial.printf("[AGPS] Seeding AID-INI with %.5f,%.5f\n", lastLat, lastLon);
-                uint32_t utc = gsmManager.getNetworkUtcEpoch();
-                gpsManager.injectAidIni(utc, lastLat, lastLon, lastAlt);
-            }
-
-#if ASSISTNOW_ENABLE
-            // Pull AssistNow Online via the Worker; stream straight to GPS UART.
-            static uint8_t agpsBuf[ASSISTNOW_MAX_LEN];
-            size_t agpsLen = 0;
-            if (serverComm.fetchAssistNow(agpsBuf, sizeof(agpsBuf), &agpsLen) && agpsLen > 0) {
-                Serial.printf("[AGPS] Injecting %u bytes from AssistNow\n",
-                              (unsigned)agpsLen);
-                gpsManager.injectAssistNowBlob(agpsBuf, agpsLen);
-                if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    deviceState.agps_injected = true;
-                    deviceState.agps_bytes    = (uint16_t)agpsLen;
-                    xSemaphoreGive(stateMutex);
-                }
-            } else {
-                Serial.println("[AGPS] AssistNow fetch failed — relying on AID-INI seed only");
-            }
-#endif
-            agpsDone = true;
-        }
         
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             deviceState.gprs_connected = connected;
@@ -242,51 +193,39 @@ void uplinkTask(void* param) {
         }
 
         if (connected) {
-            // ── Adaptive batching ──
-            // Send when EITHER the buffer has a full batch, OR enough time
-            // has elapsed since the last send. This keeps motion latency low
-            // while still amortising TCP cost when stationary.
-            bool isMoving = false;
-            if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                isMoving = deviceState.speed_kmh > SPEED_THRESHOLD_KMH;
+            if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                deviceState.is_uploading = true;
                 xSemaphoreGive(stateMutex);
             }
-            int       batchSize  = isMoving ? UPLINK_BATCH_SIZE_MOVING : UPLINK_BATCH_SIZE_IDLE;
-            uint32_t  intervalMs = isMoving ? UPLINK_INTERVAL_MOVING   : UPLINK_INTERVAL_IDLE;
-            uint32_t  bufCount   = packetBuffer.count();
-            bool      timeReady  = (millis() - lastSendMs) >= intervalMs;
-            bool      batchReady = bufCount >= (uint32_t)batchSize;
 
-            if (bufCount > 0 && (batchReady || timeReady)) {
-                if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    deviceState.is_uploading = true;
-                    xSemaphoreGive(stateMutex);
-                }
+            // Choose batch size: 1 packet/cycle when moving (≈1-per-second goal),
+            // 5 packets/cycle when idle (efficient backlog drain).
+            bool isMoving = false;
+            if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                isMoving = deviceState.speed_kmh > 0.0;
+                xSemaphoreGive(stateMutex);
+            }
+            int batchSize = isMoving ? UPLINK_BATCH_SIZE_MOVING : UPLINK_BATCH_SIZE_IDLE;
+            int sent = serverComm.sendBatch(batchSize);
 
-                int sendCap = (int)bufCount;
-                if (sendCap > batchSize) sendCap = batchSize;
-                int sent = serverComm.sendBatch(sendCap);
-                lastSendMs = millis();
-
-                if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    deviceState.is_uploading = false;
-                    deviceState.last_http_code = serverComm.getLastHttpCode();
-                    strncpy(deviceState.last_response, serverComm.getLastResponse().c_str(), sizeof(deviceState.last_response));
-                    strncpy(deviceState.tcp_stage, serverComm.getTcpStage().c_str(), sizeof(deviceState.tcp_stage));
-                    deviceState.tcp_hdr_sent = (uint16_t)serverComm.getTcpHdrSent();
-                    deviceState.tcp_bod_sent = (uint16_t)serverComm.getTcpBodSent();
-                    deviceState.tcp_bod_len  = (uint16_t)serverComm.getTcpBodLen();
-                    if (sent > 0) {
-                        deviceState.total_packets_sent += sent;
-                        deviceState.last_uplink_time = millis();
-                    }
-                    xSemaphoreGive(stateMutex);
-                }
-
+            if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                deviceState.is_uploading = false;
+                deviceState.last_http_code = serverComm.getLastHttpCode();
+                strncpy(deviceState.last_response, serverComm.getLastResponse().c_str(), sizeof(deviceState.last_response));
+                strncpy(deviceState.tcp_stage, serverComm.getTcpStage().c_str(), sizeof(deviceState.tcp_stage));
+                deviceState.tcp_hdr_sent = (uint16_t)serverComm.getTcpHdrSent();
+                deviceState.tcp_bod_sent = (uint16_t)serverComm.getTcpBodSent();
+                deviceState.tcp_bod_len  = (uint16_t)serverComm.getTcpBodLen();
                 if (sent > 0) {
-                    // After successful send, poll for commands
-                    commandHandler.pollAndExecute();
+                    deviceState.total_packets_sent += sent;
+                    deviceState.last_uplink_time = millis();
                 }
+                xSemaphoreGive(stateMutex);
+            }
+
+            if (sent > 0) {
+                // After successful send, poll for commands
+                commandHandler.pollAndExecute();
             }
         } else {
             gsmManager.ensureConnection();
@@ -309,9 +248,23 @@ void uplinkTask(void* param) {
             }
         }
 
-        // Yield briefly so other tasks aren't starved while we spin between
-        // sends. Pacing is now driven by `batchReady || timeReady` above.
-        vTaskDelay(pdMS_TO_TICKS(200));
+        // ── Speed-adaptive uplink interval ──
+        // When moving (speed > 0), upload as fast as the modem allows — TCP
+        // latency (~5-10s per batch) provides natural pacing so no extra delay
+        // is needed. When stationary, wait 10s to avoid hammering the modem.
+        {
+            double spd = 0.0;
+            if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                spd = deviceState.speed_kmh;
+                xSemaphoreGive(stateMutex);
+            }
+            uint32_t uplinkDelay = (spd > 0.0)
+                                   ? UPLINK_INTERVAL_MOVING
+                                   : UPLINK_INTERVAL_IDLE;
+            if (uplinkDelay > 0) {
+                vTaskDelay(pdMS_TO_TICKS(uplinkDelay));
+            }
+        }
     }
 }
 
