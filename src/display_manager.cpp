@@ -72,6 +72,7 @@ void DisplayManager::render(const DeviceState& state) {
         case 5: renderTcpDebugScreen(state); break;
         case 6: renderModuleDiagsScreen(state); break;
         case 7: renderMessagesScreen(state); break;
+        case 8: renderClockScreen(state);  break;
     }
 
     _display->display();
@@ -90,6 +91,10 @@ void DisplayManager::toggleDisplay() {
             _display->oled_command(SH110X_DISPLAYOFF);
         }
     }
+}
+
+void DisplayManager::toggleClockScreen() {
+    _currentScreen = (_currentScreen == CLOCK_SCREEN_IDX) ? 0 : CLOCK_SCREEN_IDX;
 }
 
 // ─────────────────────────────────────────────
@@ -449,6 +454,52 @@ void DisplayManager::renderSmsReaderView(const DeviceState& state) {
 
     _display->setCursor(0, 118);
     _display->printf("[A] Next  [B] NextMsg");
+}
+
+// ─────────────────────────────────────────────
+// Screen 8: Clock dashboard
+// Stripped-down status bar + big HH:MM + date at bottom.
+// ─────────────────────────────────────────────
+void DisplayManager::renderClockScreen(const DeviceState& state) {
+    // ── Stripped status bar ──────────────────────────────────────────────
+    drawSignalBars(0, 0, state.signal_percent, !state.gprs_connected);
+
+    // Small unread-SMS envelope, centred so it doesn't fight the other
+    // indicators. Only shown when there's something to read.
+    if (state.sms_unread_count > 0) {
+        const int bx = 58, by = 1;
+        _display->fillRect(bx, by, 11, 8, SH110X_WHITE);
+        _display->drawLine(bx,     by, bx + 5,  by + 4, SH110X_BLACK);
+        _display->drawLine(bx + 10, by, bx + 5, by + 4, SH110X_BLACK);
+    }
+
+    _display->setTextSize(1);
+    _display->setCursor(96, 0);
+    if (state.battery_percent >= 0) _display->printf("%d%%", state.battery_percent);
+    else                            _display->print("---%");
+
+    _display->drawLine(0, 11, 128, 11, SH110X_WHITE);
+
+    // ── Time: HH:MM in size-4 digits ────────────────────────────────────
+    char timeBuf[6];
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", state.hour, state.minute);
+
+    _display->setTextSize(4);
+    // size-4 character cell = 24 px wide; "HH:MM" = 5 chars = 120 px.
+    // Centre on the 128 px screen, vertically split the area between the
+    // header divider (y=11) and the date strip (y≈100).
+    const int timeWidth = 5 * 6 * 4;
+    _display->setCursor((128 - timeWidth) / 2, 40);
+    _display->print(timeBuf);
+
+    // ── Date: DD/MM/YYYY in size-2 ──────────────────────────────────────
+    char dateBuf[12];
+    snprintf(dateBuf, sizeof(dateBuf), "%02d/%02d/%04d", state.day, state.month, state.year);
+
+    _display->setTextSize(2);
+    const int dateWidth = 10 * 6 * 2;  // 120 px
+    _display->setCursor((128 - dateWidth) / 2, 104);
+    _display->print(dateBuf);
 }
 
 // ── Helpers ──

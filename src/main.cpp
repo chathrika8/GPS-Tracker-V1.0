@@ -559,8 +559,8 @@ void buttonTask(void* param) {
                         if (displayManager.getCurrentScreen() == 7 && deviceState.msg_sub_screen == 1) {
                             deviceState.msg_sub_screen = 0; // back to list
                         } else {
-                            // Enter deep sleep
-                            powerManager.enterDeepSleep(0); // 0 = no timed wake
+                            // Jump to / from the clock dashboard.
+                            displayManager.toggleClockScreen();
                         }
                         break;
                     default:

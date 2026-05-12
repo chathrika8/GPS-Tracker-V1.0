@@ -10,6 +10,9 @@ public:
     void render(const DeviceState& state);
     void nextScreen();
     void toggleDisplay();
+    // Jump straight to the clock dashboard, or back to the main dashboard
+    // if already showing it. Used by the BTN_B_LONG shortcut.
+    void toggleClockScreen();
     uint8_t getCurrentScreen() { return _currentScreen; }
 
 private:
@@ -17,7 +20,8 @@ private:
     uint8_t _currentScreen = 0;
     bool    _displayOn     = true;
 
-    static const uint8_t NUM_SCREENS = 8;
+    static const uint8_t NUM_SCREENS      = 9;
+    static const uint8_t CLOCK_SCREEN_IDX = 8;
 
     void renderMainScreen(const DeviceState& state);
     void renderGSMScreen(const DeviceState& state);
@@ -29,6 +33,7 @@ private:
     void renderMessagesScreen(const DeviceState& state);
     void renderSmsListView(const DeviceState& state);
     void renderSmsReaderView(const DeviceState& state);
+    void renderClockScreen(const DeviceState& state);
 
     void drawSignalBars(int x, int y, int percent, bool animate_loading = false);
     void drawHeader(const DeviceState& state);
