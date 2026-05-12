@@ -32,14 +32,24 @@ public:
     uint32_t count();
     void clear();
     bool isFull();
+    bool isHealthy() { return _healthy; }
 
 private:
     static const char* BUFFER_FILE;
+    static const char* COMPACT_TMP_FILE;
     static const uint32_t MAX_PACKETS = 2000;
 
     uint32_t  _readOffset  = 0;
     uint32_t  _writeOffset = 0;
     uint32_t  _count       = 0;
+    bool      _healthy     = false;
+    bool      _errLogged   = false; // suppress per-packet error spam
+
+    // Move the live region to the front of the file using a small stack
+    // buffer and an atomic temp-file rename. Avoids ever allocating the
+    // whole remaining payload on the heap. Returns true on success.
+    bool compactInPlace();
+    void markUnhealthy(const char* reason);
 };
 
 extern PacketBuffer packetBuffer;
