@@ -110,6 +110,38 @@ void PacketBuffer::removeBatch(int count) {
     }
 }
 
+uint32_t PacketBuffer::dropOlderThan(uint32_t cutoffEpoch) {
+    if (_count == 0) return 0;
+
+    File f = LittleFS.open(BUFFER_FILE, FILE_READ);
+    if (!f) return 0;
+
+    if (!f.seek(_readOffset)) { f.close(); return 0; }
+
+    uint32_t dropped = 0;
+    while (_count > 0) {
+        GPSPacket pkt;
+        if (f.read((uint8_t*)&pkt, sizeof(pkt)) != sizeof(pkt)) break;
+        // Stop at the first fresh packet — the rest are at least as new
+        // because store() appends in chronological order.
+        if (pkt.timestamp >= cutoffEpoch) break;
+        _readOffset += sizeof(GPSPacket);
+        _count--;
+        dropped++;
+    }
+    f.close();
+
+    if (dropped > 0) {
+        LOG("[BUF] Dropped %u stale packets\n", (unsigned)dropped);
+        if (_count == 0) {
+            LittleFS.remove(BUFFER_FILE);
+            _readOffset  = 0;
+            _writeOffset = 0;
+        }
+    }
+    return dropped;
+}
+
 uint32_t PacketBuffer::count()  { return _count; }
 bool     PacketBuffer::isFull() { return _count >= MAX_PACKETS; }
 

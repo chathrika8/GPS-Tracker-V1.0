@@ -47,6 +47,9 @@
 #ifndef AGPS_RESEED_KM
 #define AGPS_RESEED_KM             50
 #endif
+#ifndef STALE_PACKET_MAX_AGE_SEC
+#define STALE_PACKET_MAX_AGE_SEC   30
+#endif
 
 // Approximate great-circle distance in km using the equirectangular
 // projection. Plenty accurate for the "did the device move?" check.
@@ -347,11 +350,22 @@ void uplinkTask(void* param) {
             // Send when EITHER the buffer has a full batch, OR enough time
             // has elapsed since the last send. This keeps motion latency low
             // while still amortising TCP cost when stationary.
-            bool isMoving = false;
+            bool     isMoving = false;
+            uint32_t nowEpoch = 0;
             if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 isMoving = deviceState.speed_kmh > SPEED_THRESHOLD_KMH;
+                nowEpoch = deviceState.utc_epoch;
                 xSemaphoreGive(stateMutex);
             }
+
+            // Drop anything older than 30 s so a slow 2G link can't trap
+            // us replaying ancient history while fresh positions queue up
+            // behind it. Skip if we don't have a trustworthy time yet —
+            // nowEpoch == 0 means GPS hasn't fixed and GSM hasn't synced.
+            if (nowEpoch > STALE_PACKET_MAX_AGE_SEC) {
+                packetBuffer.dropOlderThan(nowEpoch - STALE_PACKET_MAX_AGE_SEC);
+            }
+
             int       batchSize  = isMoving ? UPLINK_BATCH_SIZE_MOVING : UPLINK_BATCH_SIZE_IDLE;
             uint32_t  intervalMs = isMoving ? UPLINK_INTERVAL_MOVING   : UPLINK_INTERVAL_IDLE;
             uint32_t  bufCount   = packetBuffer.count();

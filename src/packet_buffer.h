@@ -24,6 +24,11 @@ public:
     bool store(const GPSPacket& pkt);
     int  readBatch(GPSPacket* out, int maxCount);
     void removeBatch(int count);
+    // Drop packets at the head of the buffer whose timestamp is strictly
+    // older than cutoffEpoch. Returns the number dropped. No-op if the
+    // buffer is empty. Packets are appended in chronological order, so we
+    // can stop at the first fresh one.
+    uint32_t dropOlderThan(uint32_t cutoffEpoch);
     uint32_t count();
     void clear();
     bool isFull();
